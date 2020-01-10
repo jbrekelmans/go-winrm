@@ -1,17 +1,19 @@
-package client
+package winrm
 
 import (
 	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"mime"
 	"net/http"
+	"reflect"
 	"strings"
+	"unsafe"
 
 	zenwinrm "github.com/masterzen/winrm"
 	"github.com/masterzen/winrm/soap"
+	log "github.com/sirupsen/logrus"
 )
 
 const SoapXMLMimeType = "application/soap+xml"
@@ -26,6 +28,7 @@ type Client struct {
 	zenClient  *zenwinrm.Client
 	url        string
 	user       string
+	zenParams  *zenwinrm.Parameters
 }
 
 func NewClient(
@@ -84,18 +87,20 @@ func (c *Client) init() error {
 	// 2. winrm does not close the response body in the error case: https://github.com/masterzen/winrm/blob/1d17eaf15943ca3554cdebb3b1b10aaa543a0b7e/http.go#L95
 	// 3. winrm's check for the response content type is fishy: https://github.com/masterzen/winrm/blob/1d17eaf15943ca3554cdebb3b1b10aaa543a0b7e/http.go#L21
 	//    See doPost for a more solid approach.
-	params := *zenwinrm.DefaultParameters
-	params.TransportDecorator = func() zenwinrm.Transporter {
-		return &zenTransporterAdapter{
-			client: c,
-		}
+	c.zenParams = new(zenwinrm.Parameters)
+	*c.zenParams = *zenwinrm.DefaultParameters
+	t := &zenTransporterAdapter{
+		client: c,
+	}
+	c.zenParams.TransportDecorator = func() zenwinrm.Transporter {
+		return t
 	}
 	c.zenClient, err = zenwinrm.NewClientWithParameters(
 		dummyEndpoint, // values are computed based on this argument, or copied from this argument by winrm, but these are invisible side
 		// effects that have no effect on the behavior, if you study the code.
 		"", // username is purposely set to the empty string since doPost handles authentication
 		"", // password is purposely set to the empty string since doPost handles authentication
-		&params,
+		c.zenParams,
 	)
 	return err
 }
@@ -118,7 +123,7 @@ func (c *Client) doPost(request *soap.SoapMessage) (string, error) {
 		var errorInfo strings.Builder
 		_, err = io.CopyN(&errorInfo, res.Body, 4*1024)
 		if err != nil {
-			log.Printf("error while reading response body of HTTP request %s %#v: %v", method, c.url, err)
+			log.Errorf("error while reading response body of HTTP request %s %#v: %v", method, c.url, err)
 		}
 		return "", fmt.Errorf("server responded to %s %#v with unexpected HTTP status %d, body prefix: %#v", method, c.url, res.StatusCode, errorInfo.String())
 	}
@@ -140,7 +145,87 @@ func (c *Client) doPost(request *soap.SoapMessage) (string, error) {
 	return string(resBodyData), nil
 }
 
+func getShellID(shell *zenwinrm.Shell) string {
+	reflectShellPtr := reflect.ValueOf(shell)
+	reflectShell := reflect.Indirect(reflectShellPtr)
+	shellIDMember := reflectShell.FieldByName("id")
+	ptrToShellIDUnsafe := unsafe.Pointer(shellIDMember.UnsafeAddr())
+	ptrToShellID := (*string)(ptrToShellIDUnsafe)
+	shellID := *ptrToShellID
+	return shellID
+}
+
+// The maximum command line size is 8191 as per Microsoft documentation, but this is the maximum size we can pass to
+// (*Shell).Execute without getting a command too long error (so it appears there is some internal overhead).
+const cmdExeMaxCommandSize = 8157
+
 // CreateShell creates a cmd.exe Shell that can be used to run commands.
-func (c *Client) CreateShell() (*zenwinrm.Shell, error) {
-	return c.zenClient.CreateShell()
+func (c *Client) CreateShell() (*Shell, error) {
+	zenShell, err := c.zenClient.CreateShell()
+	if err != nil {
+		return nil, err
+	}
+	id := getShellID(zenShell)
+	zenParams := c.ZenParametersConst()
+	request := zenwinrm.NewExecuteCommandRequest(c.URL(), id, "", []string{}, zenParams)
+	maxSizeOfCommandWithZeroArguments := min(zenParams.EnvelopeSize-len(request.String()), cmdExeMaxCommandSize)
+	return &Shell{
+		c:                                 c,
+		id:                                id,
+		maxSizeOfCommandWithZeroArguments: maxSizeOfCommandWithZeroArguments,
+		zenShell:                          zenShell,
+	}, nil
+}
+
+// URL returns the remote management URL associated with this client.
+func (c *Client) URL() string {
+	return c.url
+}
+
+// ZenParametersConst returns the *"github.com/masterzen/winrm".Parameters associated with this client.
+// The value pointed to should not be modified. This function is usefull when creating requests manually to compute
+// size bounds (e.g. "github.com/masterzen/winrm".NewExecuteCommandRequest).
+func (c *Client) ZenParametersConst() *zenwinrm.Parameters {
+	return c.zenParams
+}
+
+// Shell is a wrapper for "github.com/masterzen/winrm".Shell
+type Shell struct {
+	c                                 *Client
+	maxSizeOfCommandWithZeroArguments int
+	zenShell                          *zenwinrm.Shell
+	id                                string
+}
+
+// Client returns the *Client associated with this Shell
+func (s *Shell) Client() *Client {
+	return s.c
+}
+
+// Close is a wrapper that calls (*"github.com/masterzen/winrm".Shell).Close on the wrapped *"github.com/masterzen/winrm".Shell
+func (s *Shell) Close() error {
+	return s.zenShell.Close()
+}
+
+// Execute is a wrapper that calls (*"github.com/masterzen/winrm".Shell).Execute on the wrapped *"github.com/masterzen/winrm".Shell
+func (s *Shell) Execute(command string, arguments ...string) (*zenwinrm.Command, error) {
+	return s.zenShell.Execute(command, arguments...)
+}
+
+// ID returns the ID of this Shell
+func (s *Shell) ID() string {
+	return s.id
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// MaxSizeOfCommandWithZeroArguments returns the maximum length of a command string that can be passed to Execute, if the command has zero
+// arguments.
+func (s *Shell) MaxSizeOfCommandWithZeroArguments() int {
+	return s.maxSizeOfCommandWithZeroArguments
 }
