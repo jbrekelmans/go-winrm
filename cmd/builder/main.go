@@ -16,7 +16,11 @@ func main() {
 	log.SetOutput(os.Stdout)
 	log.SetLevel(log.DebugLevel)
 
+	shellCount := 2
 	useTLS := true
+	localRoot := "scripts/cloud-builders-community/windows-builder"
+	remoteRoot := "C:\\workspace2"
+
 	host := ""
 	port := 5986
 	user := ""
@@ -33,19 +37,35 @@ func main() {
 	if err != nil {
 		log.Fatalf("error while initializing winrm client: %v", err)
 	}
-	shell, err := c.CreateShell()
-	if err != nil {
-		log.Fatalf("error while creating remote shell: %v", err)
+	shells := make([]*winrm.Shell, shellCount)
+	for i := 0; i < shellCount; i++ {
+		var err1 error
+		shells[i], err1 = c.CreateShell()
+		if err != nil {
+			for i > 0 {
+				i--
+				err2 := shells[i].Close()
+				if err2 != nil {
+					log.Errorf("error while closing shell: %v", err2)
+				}
+			}
+			log.Fatalf("error while creating remote shell: %v", err1)
+		}
 	}
-	defer shell.Close()
-	localRoot := "scripts/cloud-builders-community/windows-builder"
-	remoteRoot := "C:\\workspace2"
-	// winrm.MustRunCommand(shell, []string{`winrm get winrm/config`})
-	winrm.MustRunCommand(shell, []string{fmt.Sprintf(`if exist "%s" rd /s /q "%s"`, remoteRoot+"\\", remoteRoot)})
-	copier, err := winrm.NewFileTreeCopier(shell, remoteRoot, localRoot)
+	defer func() {
+		for _, shell := range shells {
+			err := shell.Close()
+			if err != nil {
+				log.Errorf("error while closing shell: %v", err)
+			}
+		}
+	}()
+	// winrm.MustRunCommand(shells[0], []string{`winrm get winrm/config`})
+	winrm.MustRunCommand(shells[0], []string{fmt.Sprintf(`if exist "%s" rd /s /q "%s"`, remoteRoot+"\\", remoteRoot)})
+	copier, err := winrm.NewFileTreeCopier(shells, remoteRoot, localRoot)
 	err = copier.Run()
 	if err != nil {
 		log.Fatalf("error while copying file: %v", err)
 	}
-	winrm.MustRunCommand(shell, []string{fmt.Sprintf(`type "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder\\README.md")})
+	winrm.MustRunCommand(shells[0], []string{fmt.Sprintf(`type "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder\\README.md")})
 }

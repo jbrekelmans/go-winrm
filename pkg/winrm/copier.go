@@ -54,12 +54,12 @@ type FileTreeCopier struct {
 	localRoot     string
 	localRootStat os.FileInfo
 	remoteRoot    string
-	shell         *Shell
+	// One shell for each winrs worker.
+	shells map[*Shell]bool
 	// The waitGroup counter is incremented for each winrsTask that is created, and once for each scanDirTask that is created.
 	waitGroup        sync.WaitGroup
 	winrsTaskQueue   chan *winrsTask
 	scanDirTaskQueue chan *scanDirTask
-	winrsWorkerCount int
 }
 
 // NewFileTreeCopier creates a new file copier. remoteRoot must be a cleaned absolute Windows file path that starts
@@ -69,16 +69,23 @@ type FileTreeCopier struct {
 //    equal name, or a name case-insensitive equal to the base name of localRoot concatenated with .b64
 // 2. after cleaning localRoot (filepath.Clean), it should not contain any characters outside the regular expression class [a-zA-Z0-9-_\. ],
 //    because escaping such file names is not supported.
-func NewFileTreeCopier(shell *Shell, remoteRoot, localRoot string) (*FileTreeCopier, error) {
+func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTreeCopier, error) {
 	f := &FileTreeCopier{
 		localRoot:  localRoot,
 		remoteRoot: remoteRoot,
-		shell:      shell,
-		// Currently set to one because we only have one shell, but the intention is to use many shells at once.
-		winrsWorkerCount: 1,
+		shells:     map[*Shell]bool{},
 	}
-	if f.shell == nil {
-		return nil, fmt.Errorf("shell must not be nil")
+	if len(shells) == 0 {
+		return nil, fmt.Errorf("shells cannot be empty")
+	}
+	for _, shell := range shells {
+		if shell == nil {
+			return nil, fmt.Errorf("shells contains a nil shell")
+		}
+		if _, ok := f.shells[shell]; ok {
+			return nil, fmt.Errorf("shells contains duplicate shell objects")
+		}
+		f.shells[shell] = true
 	}
 	if filepath.IsAbs(f.localRoot) {
 		return nil, fmt.Errorf("localRoot must be a relative file")
@@ -98,8 +105,8 @@ func NewFileTreeCopier(shell *Shell, remoteRoot, localRoot string) (*FileTreeCop
 	if err != nil {
 		return nil, err
 	}
-	f.winrsTaskQueue = make(chan *winrsTask, f.winrsWorkerCount*2)
-	f.scanDirTaskQueue = make(chan *scanDirTask, 2)
+	f.winrsTaskQueue = make(chan *winrsTask, len(f.shells)*2)
+	f.scanDirTaskQueue = make(chan *scanDirTask, len(f.shells))
 	return f, nil
 }
 
@@ -259,7 +266,12 @@ func (f *FileTreeCopier) scanDirWorkerRegularFile(localFileParent, localFile str
 func (f *FileTreeCopier) Run() error {
 	if f.localRootStat.Mode()&os.ModeType == 0 {
 		// root is a regular file, simple case
-		w := newWinrsWorker(f, 0, f.shell)
+		var shell *Shell
+		for s := range f.shells {
+			shell = s
+			break
+		}
+		w := newWinrsWorker(f, 0, shell)
 		remoteFile := f.getRemoteFile(f.localRoot)
 		i := strings.LastIndex(remoteFile, "\\")
 		// i must be greater than 0, by NewFileTreeCopier precondition
@@ -290,9 +302,11 @@ func (f *FileTreeCopier) Run() error {
 	} else {
 		f.createMkdirTaskForRootOfFileTreeToCopy(f.localRoot)
 	}
-	for i := 0; i < f.winrsWorkerCount; i++ {
-		winrsWorker := newWinrsWorker(f, i, f.shell)
+	i := 0
+	for shell := range f.shells {
+		winrsWorker := newWinrsWorker(f, i, shell)
 		go winrsWorker.Run()
+		i++
 	}
 	go f.scanDirWorker()
 	f.waitGroup.Wait()
