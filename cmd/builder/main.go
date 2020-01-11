@@ -47,5 +47,5 @@ func main() {
 	if err != nil {
 		log.Fatalf("error while copying file: %v", err)
 	}
-	// winrm.MustRunCommand(shell, []string{fmt.Sprintf(`type "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder\\README.md")})
+	winrm.MustRunCommand(shell, []string{fmt.Sprintf(`type "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder\\README.md")})
 }

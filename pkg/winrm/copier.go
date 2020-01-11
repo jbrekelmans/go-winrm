@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,9 @@ import (
 const parentPrefix = ".." + string(os.PathSeparator)
 const dotBase64 = ".b64"
 const shellUtilizationLogLevel = log.DebugLevel
+
+var regexpRemoteFileThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9]:(?:\\|(?:\\[a-zA-Z0-9-_\. ]+)+)$`)
+var regexpFileBasenameThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9-_\. ]+$`)
 
 type winrsTaskType int
 
@@ -58,15 +62,14 @@ type FileTreeCopier struct {
 	winrsWorkerCount int
 }
 
-// NewFileTreeCopier creates a new file copier. remoteRoot must be a cleaned absolute Windows file path that does not
-// start with an UNC prefix.
+// NewFileTreeCopier creates a new file copier. remoteRoot must be a cleaned absolute Windows file path that starts
+// with a drive letter.
+// Limitations:
+// 1. if localRoot is a regular file then the remote directory to which it would be copied must not contain an entry with a case-insensitive
+//    equal name, or a name case-insensitive equal to the base name of localRoot concatenated with .b64
+// 2. after cleaning localRoot (filepath.Clean), it should not contain any characters outside the regular expression class [a-zA-Z0-9-_\. ],
+//    because escaping such file names is not supported.
 func NewFileTreeCopier(shell *Shell, remoteRoot, localRoot string) (*FileTreeCopier, error) {
-	if shell == nil {
-		return nil, fmt.Errorf("shell must not be nil")
-	}
-	if filepath.IsAbs(localRoot) {
-		return nil, fmt.Errorf("localRoot must be a relative file")
-	}
 	f := &FileTreeCopier{
 		localRoot:  localRoot,
 		remoteRoot: remoteRoot,
@@ -74,15 +77,23 @@ func NewFileTreeCopier(shell *Shell, remoteRoot, localRoot string) (*FileTreeCop
 		// Currently set to one because we only have one shell, but the intention is to use many shells at once.
 		winrsWorkerCount: 1,
 	}
+	if f.shell == nil {
+		return nil, fmt.Errorf("shell must not be nil")
+	}
+	if filepath.IsAbs(f.localRoot) {
+		return nil, fmt.Errorf("localRoot must be a relative file")
+	}
 	f.localRoot = filepath.Clean(f.localRoot)
 	if f.localRoot == ".." || strings.HasPrefix(f.localRoot, parentPrefix) {
 		return nil, fmt.Errorf("localRoot must be a relative file within the current working directory")
 	}
-	var err error
-	err = validateFileName(f.localRoot)
-	if err != nil {
-		return nil, err
+	remoteFile := f.getRemoteFile(f.localRoot)
+	if !regexpRemoteFileThatDoesNotNeedEscaping.MatchString(remoteFile) {
+		return nil, fmt.Errorf("either remoteRoot is not an absolute cleaned Windows path starting with a drive letter, or remoteRoot or "+
+			"localRoot has a path component that requires currently unsupported cmd.exe escape logic. The regexp for validating path "+
+			"components is %s", regexpFileBasenameThatDoesNotNeedEscaping.String())
 	}
+	var err error
 	f.localRootStat, err = os.Lstat(f.localRoot)
 	if err != nil {
 		return nil, err
@@ -108,6 +119,7 @@ func newWinrsWorker(f *FileTreeCopier, id int, shell *Shell) *winrsWorker {
 }
 
 func (w *winrsWorker) RunCommand(commandAndArgs []string) error {
+	log.Tracef(commandAndArgs[0])
 	if !log.IsLevelEnabled(shellUtilizationLogLevel) {
 		return RunCommand(w.shell, commandAndArgs)
 	}
@@ -167,9 +179,13 @@ func (f *FileTreeCopier) addError(err error) {
 	f.errors = append(f.errors, err)
 }
 
-func validateFileName(file string) error {
-	if strings.HasSuffix(file, dotBase64) {
-		return fmt.Errorf("base name of file %#v has reserved suffix %#v", file, dotBase64)
+func validateFileBasename(fileBasename string) error {
+	if strings.HasSuffix(fileBasename, dotBase64) {
+		return fmt.Errorf("basename of file system entry %#v has reserved suffix %#v", fileBasename, dotBase64)
+	}
+	if !regexpFileBasenameThatDoesNotNeedEscaping.MatchString(fileBasename) {
+		return fmt.Errorf("basename of file system entry %#v requires cmd.exe escape logic but this is not supported. The regexp used for "+
+			"validation is %s", fileBasename, regexpFileBasenameThatDoesNotNeedEscaping.String())
 	}
 	return nil
 }
@@ -186,7 +202,7 @@ func (f *FileTreeCopier) scanDirWorker() {
 			f.addError(err)
 		} else {
 			for scanner.Scan() {
-				err := validateFileName(scanner.Name())
+				err := validateFileBasename(scanner.Name())
 				if err != nil {
 					f.addError(err)
 					break
@@ -246,15 +262,17 @@ func (f *FileTreeCopier) Run() error {
 		w := newWinrsWorker(f, 0, f.shell)
 		remoteFile := f.getRemoteFile(f.localRoot)
 		i := strings.LastIndex(remoteFile, "\\")
-		// i must be greater than 0, by constructor precondition
+		// i must be greater than 0, by NewFileTreeCopier precondition
 		j := strings.LastIndex(remoteFile[:i], "\\")
-		if j >= 0 { // optimization: do not attempt to make the directory if its the root.
+		if j >= 0 {
 			err := w.makeDirectories(remoteFile[:i], true)
 			if err != nil {
 				return err
 			}
+		} else {
+			// optimization: do not attempt to make the directory if its the root.
 		}
-		return w.copyFile(f.localRoot, f.getRemoteFile(f.localRoot))
+		return w.copyFile(f.localRoot, remoteFile)
 	} else if !f.localRootStat.IsDir() {
 		// ignore everything that is not a regular file or directory
 		return nil
@@ -263,7 +281,7 @@ func (f *FileTreeCopier) Run() error {
 	remoteFile := f.getRemoteFile(f.localRoot)
 	if strings.HasSuffix(remoteFile, "\\") {
 		// the constructor precondition ensures that this is the correct check for detecting if
-		// remoteFile is the root
+		// remoteFile is the root (e.g. C:\)
 		// optimization: do not attempt to make the directory if its the root.
 		f.waitGroup.Add(1)
 		f.scanDirTaskQueue <- &scanDirTask{
@@ -291,10 +309,13 @@ func (f *FileTreeCopier) Run() error {
 func (f *FileTreeCopier) getRemoteFile(localFile string) string {
 	remoteFile := f.remoteRoot
 	if localFile != "." {
+		if !strings.HasSuffix(remoteFile, "\\") {
+			remoteFile += "\\"
+		}
 		if os.PathSeparator == '\\' {
-			remoteFile += "\\" + localFile
+			remoteFile += localFile
 		} else {
-			remoteFile += "\\" + strings.ReplaceAll(localFile, "/", "\\")
+			remoteFile += strings.ReplaceAll(localFile, "/", "\\")
 		}
 	}
 	return remoteFile
@@ -312,33 +333,46 @@ func (f *FileTreeCopier) createMkdirTaskForRootOfFileTreeToCopy(localFile string
 	}
 }
 
-func (w *winrsWorker) copyFile(localFile, remoteFile string) error {
-	var err error
-	i := strings.LastIndex(remoteFile, "\\")
-	// i must be >= 0 since f.remoteRoot is absolute
-	remoteFileDir := remoteFile[:i]
-	remoteFileDotBase64 := remoteFile + dotBase64
-	err = w.RunCommand([]string{fmt.Sprintf(`copy /y NUL "%s"`, remoteFileDotBase64)})
-	if err != nil {
-		return fmt.Errorf("error while creating empty file %#v: %w", remoteFileDir, err)
-	}
-	err = w.copyFileContentAsBase64(localFile, remoteFileDotBase64)
-	if err != nil {
-		return fmt.Errorf("error while copying file content as base64: %w", err)
-	}
-	err = w.RunCommand([]string{fmt.Sprintf(`certutil -decode "%s" "%s" && del /q "%s"`, remoteFileDotBase64, remoteFile, remoteFileDotBase64)})
-	if err != nil {
-		return fmt.Errorf("error while base64 decoding file: %w", err)
-	}
-	return nil
+type winrsFileCopier struct {
+	finalizeCommand          string
+	attemptedFinalizeCommand bool
+	localFile                string
+	remoteFile               string
+	remoteFileDotBase64      string
+	w                        *winrsWorker
 }
 
-func (w *winrsWorker) copyFileContentAsBase64(localFile, remoteFile string) error {
-	maxCommandSize := w.shell.MaxSizeOfCommandWithZeroArguments()
-	commandPrefix := "<nul set /p dummyName=\""
-	commandSuffix := "\" >> \"" + remoteFile + "\""
-	maxChunkBase64Size := maxCommandSize - len(commandPrefix) - len(commandSuffix)
+func newWinrsFileCopier(w *winrsWorker, localFile, remoteFile string) *winrsFileCopier {
+	return &winrsFileCopier{
+		w:                   w,
+		localFile:           localFile,
+		remoteFile:          remoteFile,
+		remoteFileDotBase64: remoteFile + dotBase64,
+	}
+}
+
+func (w *winrsWorker) copyFile(localFile, remoteFile string) error {
+	return newWinrsFileCopier(w, localFile, remoteFile).Run()
+}
+
+func (w *winrsFileCopier) getFinalizeCommand() string {
+	if w.finalizeCommand == "" {
+		w.finalizeCommand = fmt.Sprintf(`certutil -decode "%s" "%s"&&del /q "%s"`, w.remoteFileDotBase64, w.remoteFile, w.remoteFileDotBase64)
+	}
+	return w.finalizeCommand
+}
+
+func (w *winrsFileCopier) Run() error {
+	numberOfChunksCopied := 0
+	maxCommandSize := w.w.shell.MaxSizeOfCommandWithZeroArguments()
+	commandPrefix := `echo `
+	// Used for every chunk except the first one.
+	commandSuffix1 := `>>"` + w.remoteFileDotBase64 + `"`
+	// Used for the first chunk.
+	commandSuffix2 := `>"` + w.remoteFileDotBase64 + `"`
+	maxChunkBase64Size := maxCommandSize - len(commandPrefix) - len(commandSuffix1)
 	// We split base64 data over a number of chunks, but as an optimization require base64 chunk sizes are multiples of 4.
+	// For the first chunk, maxChunkBase64Size is off by one character, but we do not care about this (see commandSuffix1 and commandSuffix2).
 	if maxChunkBase64Size < 4 {
 		return fmt.Errorf("envelope size is too small")
 	}
@@ -350,7 +384,7 @@ func (w *winrsWorker) copyFileContentAsBase64(localFile, remoteFile string) erro
 	readBufferLength := 0
 	commandBuffer := make([]byte, maxCommandSize)
 	copy(commandBuffer[0:len(commandPrefix)], commandPrefix)
-	fd, err := os.Open(localFile)
+	fd, err := os.Open(w.localFile)
 	if err != nil {
 		return err
 	}
@@ -366,6 +400,9 @@ func (w *winrsWorker) copyFileContentAsBase64(localFile, remoteFile string) erro
 			}
 			isEOF = true
 			if readBufferLength == 0 {
+				if numberOfChunksCopied == 0 {
+					return w.emptyFile()
+				}
 				break
 			}
 			base64.StdEncoding.Encode(commandBuffer[commandBufferSize:], readBuffer[:readBufferLength])
@@ -386,16 +423,43 @@ func (w *winrsWorker) copyFileContentAsBase64(localFile, remoteFile string) erro
 				readBufferLength = 2
 			}
 		}
-		commandBufferSize += copy(commandBuffer[commandBufferSize:], commandSuffix)
-		var commandAndArgsBuffer [1]string
-		commandAndArgsBuffer[0] = string(commandBuffer[:commandBufferSize])
-		err = w.RunCommand(commandAndArgsBuffer[:])
+		if numberOfChunksCopied == 0 {
+			commandBufferSize += copy(commandBuffer[commandBufferSize:], commandSuffix2)
+		} else {
+			commandBufferSize += copy(commandBuffer[commandBufferSize:], commandSuffix1)
+		}
+		if isEOF {
+			if maxCommandSize-commandBufferSize >= 2+len(w.getFinalizeCommand()) {
+				commandBufferSize += copy(commandBuffer[commandBufferSize:], "&&")
+				commandBufferSize += copy(commandBuffer[commandBufferSize:], w.getFinalizeCommand())
+				w.attemptedFinalizeCommand = true
+			}
+		}
+		command := string(commandBuffer[:commandBufferSize])
+		err = w.w.RunCommand([]string{command})
+		numberOfChunksCopied++
 		if err != nil {
 			return err
 		}
 		if isEOF {
 			break
 		}
+	}
+	if !w.attemptedFinalizeCommand {
+		w.attemptedFinalizeCommand = true
+		err = w.w.RunCommand([]string{w.getFinalizeCommand()})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *winrsFileCopier) emptyFile() error {
+	command := fmt.Sprintf(`copy /y NUL "%s"`, w.remoteFile)
+	err := w.w.RunCommand([]string{command})
+	if err != nil {
+		return fmt.Errorf("error while creating empty file %#v: %w", w.remoteFile, err)
 	}
 	return nil
 }
