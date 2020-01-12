@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/karrick/godirwalk"
@@ -19,8 +20,8 @@ const parentPrefix = ".." + string(os.PathSeparator)
 const dotBase64 = ".b64"
 const shellUtilizationLogLevel = log.DebugLevel
 
-var regexpRemoteFileThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9]:(?:\\|(?:\\[a-zA-Z0-9-_\. ]+)+)$`)
-var regexpFileBasenameThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9-_\. ]+$`)
+var regexpRemoteFileThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9]:(?:\\|(?:\\[a-zA-Z0-9-_\. ^&]+)+)$`)
+var regexpFileBasenameThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9-_\. ^&]+$`)
 
 type winrsTaskType int
 
@@ -48,6 +49,13 @@ type scanDirTask struct {
 	LocalFile string
 }
 
+type stats struct {
+	bytesCopied           int64
+	startTime             time.Time
+	lastReportBytesCopied int64
+	lastReportTime        time.Time
+}
+
 type FileTreeCopier struct {
 	errors        []error
 	errorsMutex   sync.Mutex
@@ -59,7 +67,10 @@ type FileTreeCopier struct {
 	// The waitGroup counter is incremented for each winrsTask that is created, and once for each scanDirTask that is created.
 	waitGroup        sync.WaitGroup
 	winrsTaskQueue   chan *winrsTask
+	scanDirWorkers   int
 	scanDirTaskQueue chan *scanDirTask
+	stats            stats
+	done             chan struct{}
 }
 
 // NewFileTreeCopier creates a new file copier. remoteRoot must be a cleaned absolute Windows file path that starts
@@ -69,11 +80,15 @@ type FileTreeCopier struct {
 //    equal name, or a name case-insensitive equal to the base name of localRoot concatenated with .b64
 // 2. after cleaning localRoot (filepath.Clean), it should not contain any characters outside the regular expression class [a-zA-Z0-9-_\. ],
 //    because escaping such file names is not supported.
-func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTreeCopier, error) {
+func NewFileTreeCopier(shells []*Shell, scanDirWorkers int, remoteRoot, localRoot string) (*FileTreeCopier, error) {
 	f := &FileTreeCopier{
-		localRoot:  localRoot,
-		remoteRoot: remoteRoot,
-		shells:     map[*Shell]bool{},
+		localRoot:      localRoot,
+		remoteRoot:     remoteRoot,
+		scanDirWorkers: scanDirWorkers,
+		shells:         map[*Shell]bool{},
+	}
+	if f.scanDirWorkers < 1 {
+		return nil, fmt.Errorf("scanDirWorkers must be at least 1")
 	}
 	if len(shells) == 0 {
 		return nil, fmt.Errorf("shells cannot be empty")
@@ -97,7 +112,7 @@ func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTree
 	remoteFile := f.getRemoteFile(f.localRoot)
 	if !regexpRemoteFileThatDoesNotNeedEscaping.MatchString(remoteFile) {
 		return nil, fmt.Errorf("either remoteRoot is not an absolute cleaned Windows path starting with a drive letter, or remoteRoot or "+
-			"localRoot has a path component that requires currently unsupported cmd.exe escape logic. The regexp for validating path "+
+			"localRoot has a path component that contains an unsupported character. The regexp for validating path "+
 			"components is %s", regexpFileBasenameThatDoesNotNeedEscaping.String())
 	}
 	var err error
@@ -107,6 +122,7 @@ func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTree
 	}
 	f.winrsTaskQueue = make(chan *winrsTask, len(f.shells)*2)
 	f.scanDirTaskQueue = make(chan *scanDirTask, len(f.shells))
+	f.done = make(chan struct{})
 	return f, nil
 }
 
@@ -191,15 +207,15 @@ func validateFileBasename(fileBasename string) error {
 		return fmt.Errorf("basename of file system entry %#v has reserved suffix %#v", fileBasename, dotBase64)
 	}
 	if !regexpFileBasenameThatDoesNotNeedEscaping.MatchString(fileBasename) {
-		return fmt.Errorf("basename of file system entry %#v requires cmd.exe escape logic but this is not supported. The regexp used for "+
+		return fmt.Errorf("basename of file system entry %#v is not supported. The regexp used for "+
 			"validation is %s", fileBasename, regexpFileBasenameThatDoesNotNeedEscaping.String())
 	}
 	return nil
 }
 
-func (f *FileTreeCopier) scanDirWorker() {
+func (f *FileTreeCopier) scanDirWorker(id int) {
 	for {
-		log.Debugf("scanDirWorker: pulling task from queue")
+		log.Debugf("scanDirWorker(%d): pulling task from queue", id)
 		t, ok := <-f.scanDirTaskQueue
 		if !ok {
 			break
@@ -236,7 +252,7 @@ func (f *FileTreeCopier) scanDirWorker() {
 		}
 		f.waitGroup.Done()
 	}
-	log.Debugf("scanDirWorker: goroutine finishing")
+	log.Debugf("scanDirWorker(%d): goroutine finishing", id)
 }
 
 func (f *FileTreeCopier) scanDirWorkerDir(localFileParent, localFile string) {
@@ -264,6 +280,8 @@ func (f *FileTreeCopier) scanDirWorkerRegularFile(localFileParent, localFile str
 }
 
 func (f *FileTreeCopier) Run() error {
+	f.stats.startTime = time.Now()
+	f.stats.lastReportTime = f.stats.startTime
 	if f.localRootStat.Mode()&os.ModeType == 0 {
 		// root is a regular file, simple case
 		var shell *Shell
@@ -308,16 +326,40 @@ func (f *FileTreeCopier) Run() error {
 		go winrsWorker.Run()
 		i++
 	}
-	go f.scanDirWorker()
+	for i := 0; i < f.scanDirWorkers; i++ {
+		go f.scanDirWorker(i)
+	}
+	go f.reportLoop()
 	f.waitGroup.Wait()
-	log.Debugf("run: all tasks completed")
 	close(f.winrsTaskQueue)
 	close(f.scanDirTaskQueue)
+	f.done <- struct{}{}
+	elapsedSeconds := time.Since(f.stats.startTime).Seconds()
+	overallBytesPerSecond := float64(f.stats.bytesCopied) / elapsedSeconds
+	log.Infof("copied file tree with %d errors in %2f seconds (upload speed = %.0f bytes per second)", len(f.errors), elapsedSeconds, overallBytesPerSecond)
 	if len(f.errors) == 0 {
 		return nil
 	}
-	log.Infof("got %d errors while copying file tree", len(f.errors))
 	return f.errors[0]
+}
+
+func (f *FileTreeCopier) reportLoop() {
+	for {
+		select {
+		case <-f.done:
+			break
+		case <-time.After(time.Second * 5):
+			now := time.Now()
+			v := atomic.LoadInt64(&f.stats.bytesCopied)
+			bytesCopied := v - f.stats.lastReportBytesCopied
+			elapsedTime := now.Sub(f.stats.lastReportTime)
+			f.stats.lastReportBytesCopied = v
+			f.stats.lastReportTime = now
+			bytesCopiedPerSecond := float64(bytesCopied) / elapsedTime.Seconds()
+			log.Infof("stats: upload speed = %.0f bytes per second", bytesCopiedPerSecond)
+		}
+	}
+	log.Debugf("reportLoop: goroutine finishing")
 }
 
 func (f *FileTreeCopier) getRemoteFile(localFile string) string {
@@ -425,6 +467,7 @@ func (w *winrsFileCopier) Run() error {
 			readBufferLengthMod3 := readBufferLength % 3
 			base64.StdEncoding.Encode(commandBuffer[commandBufferSize:], readBuffer[:readBufferLength-readBufferLengthMod3])
 			commandBufferSize += base64.StdEncoding.EncodedLen(readBufferLength - readBufferLengthMod3)
+			atomic.AddInt64(&w.w.f.stats.bytesCopied, int64(readBufferLength-readBufferLengthMod3))
 			switch readBufferLengthMod3 {
 			case 0:
 				readBufferLength = 0

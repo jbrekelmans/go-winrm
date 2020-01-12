@@ -169,6 +169,7 @@ func (c *Client) CreateShell() (*Shell, error) {
 	zenParams := c.ZenParametersConst()
 	request := zenwinrm.NewExecuteCommandRequest(c.URL(), id, "", []string{}, zenParams)
 	maxSizeOfCommandWithZeroArguments := min(zenParams.EnvelopeSize-len(request.String()), cmdExeMaxCommandSize)
+	log.Debugf("created remote winrm shell %#v", id)
 	return &Shell{
 		c:                                 c,
 		id:                                id,
@@ -204,7 +205,11 @@ func (s *Shell) Client() *Client {
 
 // Close is a wrapper that calls (*"github.com/masterzen/winrm".Shell).Close on the wrapped *"github.com/masterzen/winrm".Shell
 func (s *Shell) Close() error {
-	return s.zenShell.Close()
+	err := s.zenShell.Close()
+	if err == nil {
+		log.Debugf("deleted remote winrm shell %#v", s.id)
+	}
+	return err
 }
 
 // Execute is a wrapper that calls (*"github.com/masterzen/winrm".Shell).Execute on the wrapped *"github.com/masterzen/winrm".Shell

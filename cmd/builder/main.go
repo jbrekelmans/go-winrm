@@ -17,6 +17,7 @@ func main() {
 	log.SetLevel(log.DebugLevel)
 
 	shellCount := 2
+	scanDirWorkers := 2
 	useTLS := true
 	localRoot := "scripts/cloud-builders-community/windows-builder"
 	remoteRoot := "C:\\workspace2"
@@ -62,10 +63,11 @@ func main() {
 	}()
 	// winrm.MustRunCommand(shells[0], []string{`winrm get winrm/config`})
 	winrm.MustRunCommand(shells[0], []string{fmt.Sprintf(`if exist "%s" rd /s /q "%s"`, remoteRoot+"\\", remoteRoot)})
-	copier, err := winrm.NewFileTreeCopier(shells, remoteRoot, localRoot)
+	copier, err := winrm.NewFileTreeCopier(shells, scanDirWorkers, remoteRoot, localRoot)
 	err = copier.Run()
 	if err != nil {
 		log.Fatalf("error while copying file: %v", err)
 	}
-	winrm.MustRunCommand(shells[0], []string{fmt.Sprintf(`type "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder\\README.md")})
+	winrm.MustRunCommand(shells[0], []string{fmt.Sprintf(`dir "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder")})
+	// winrm.MustRunCommand(shells[0], []string{fmt.Sprintf(`type "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder\\README.md")})
 }
