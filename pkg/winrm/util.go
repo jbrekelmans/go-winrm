@@ -17,15 +17,6 @@ import (
 func FormatPowershellScriptCommandLine(script string) []string {
 	var scriptUTF16LE bytes.Buffer
 	for _, rune := range script {
-		// Change line terminators to \r\n
-		// if rune == '\n' {
-		// 	var codePoints [4]byte
-		// 	scriptUTF16LE.Grow(4)
-		// 	binary.LittleEndian.PutUint16(codePoints[0:2], '\r')
-		// 	binary.LittleEndian.PutUint16(codePoints[2:4], '\r')
-		// 	_, _ = scriptUTF16LE.Write(codePoints[:])
-		// 	continue
-		// }
 		r1, r2 := utf16.EncodeRune(rune)
 		if r2 == unicode.ReplacementChar {
 			if rune > unicode.MaxRune {
