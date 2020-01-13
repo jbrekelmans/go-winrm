@@ -3,9 +3,10 @@ package soap
 import (
 	"encoding/base64"
 	"encoding/xml"
-	"github.com/gofrs/uuid"
 	"strconv"
 	"strings"
+
+	"github.com/gofrs/uuid"
 )
 
 const Locale = "en-US"

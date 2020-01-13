@@ -16,11 +16,8 @@ func main() {
 	log.SetLevel(log.DebugLevel)
 
 	shellCount := 2
-	scanDirWorkers := 2
 	useTLS := true
-	localRoot := "scripts/cloud-builders-community/windows-builder"
-	remoteRoot := "C:\\workspace2"
-
+	maxEnvelopeSize := 500 * 1000
 	host := ""
 	port := 5986
 	user := ""
@@ -33,7 +30,7 @@ func main() {
 			},
 		},
 	}
-	c, err := winrm.NewClient(useTLS, host, port, user, password, httpClient, context.Background())
+	c, err := winrm.NewClient(useTLS, host, port, user, password, httpClient, context.Background(), &maxEnvelopeSize)
 	if err != nil {
 		log.Fatalf("error while initializing winrm client: %v", err)
 	}
@@ -60,13 +57,18 @@ func main() {
 			}
 		}
 	}()
-	// winrm.MustRunCommand(shells[0], `winrm get winrm/config`, nil)
-	winrm.MustRunCommand(shells[0], fmt.Sprintf(`if exist "%s" rd /s /q "%s"`, remoteRoot+"\\", remoteRoot), nil)
+	scanDirWorkers := 2
+	localRoot := "scripts/cloud-builders-community/windows-builder"
+	remoteRoot := "C:\\workspace2"
+	// localRoot := "scripts/cloud-builders-community/windows-builder/scripts/bootstrap.ps1"
+	// remoteRoot := "C:\\workspace2\\bootstrap.ps1"
+	winrm.MustRunCommand(shells[0], `winrm get winrm/config`, nil, true, false)
+	winrm.MustRunCommand(shells[0], fmt.Sprintf(`if exist "%s" rd /s /q "%s"`, remoteRoot+"\\", remoteRoot), nil, true, false)
 	copier, err := winrm.NewFileTreeCopier(shells, scanDirWorkers, remoteRoot, localRoot)
 	err = copier.Run()
 	if err != nil {
 		log.Fatalf("error while copying file: %v", err)
 	}
-	winrm.MustRunCommand(shells[0], fmt.Sprintf(`dir "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder"), nil)
-	// winrm.MustRunCommand(shells[0], fmt.Sprintf(`type "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder\\README.md"), nil)
+	winrm.MustRunCommand(shells[0], fmt.Sprintf(`dir "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder"), nil, true, false)
+	winrm.MustRunCommand(shells[0], fmt.Sprintf(`type "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder\\README.md"), nil, true, false)
 }

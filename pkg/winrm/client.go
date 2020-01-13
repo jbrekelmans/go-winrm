@@ -46,7 +46,8 @@ func NewClient(
 	port int,
 	user, password string,
 	httpClient *http.Client,
-	ctx context.Context) (*Client, error) {
+	ctx context.Context,
+	maxEnvelopeSize *int) (*Client, error) {
 	c := &Client{
 		ctx:                            ctx,
 		httpClient:                     httpClient,
@@ -58,10 +59,14 @@ func NewClient(
 	if c.ctx == nil {
 		return nil, fmt.Errorf("ctx must not be nil")
 	}
+	// Choose an arbitrary probably-large-enough minimum to have at least some validation.
+	if maxEnvelopeSize != nil && *maxEnvelopeSize < 5000 {
+		return nil, fmt.Errorf("maxEnvelopeSize must be at least 5000")
+	}
 	if c.httpClient == nil {
 		c.httpClient = http.DefaultClient
 	}
-	err := c.init()
+	err := c.init(maxEnvelopeSize)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +96,7 @@ func (t *zenTransporterAdapter) Post(zenClient *zenwinrm.Client, request *zensoa
 	return t.client.doPost(request.String())
 }
 
-func (c *Client) init() error {
+func (c *Client) init(maxEnvelopeSize *int) error {
 	var err error
 	// We now initialize zenClient with a custom transport, reasoning is as follows:
 	// 1. winrm unnecessarily creates a http.Client instance for each request: https://github.com/masterzen/winrm/blob/1d17eaf15943ca3554cdebb3b1b10aaa543a0b7e/http.go#L82
@@ -102,6 +107,9 @@ func (c *Client) init() error {
 	*c.zenParams = *zenwinrm.DefaultParameters
 	if c.zenParams.Locale != soap.Locale {
 		panic("zenParams default locale changed, please update this script")
+	}
+	if maxEnvelopeSize != nil {
+		c.zenParams.EnvelopeSize = *maxEnvelopeSize
 	}
 	c.zenParams.Timeout = fmt.Sprintf("PT%dS", c.defaultOperationTimeoutSeconds)
 	t := &zenTransporterAdapter{
@@ -342,7 +350,7 @@ type commandWriter struct {
 	c *Command
 }
 
-func (s *Shell) StartCommand(command string, args []string, winrsConsoleModeStdin bool) (*Command, error) {
+func (s *Shell) StartCommand(command string, args []string, winrsConsoleModeStdin, winrsSkipCmdShell bool) (*Command, error) {
 	messageID, err := uuid.NewV4()
 	if err != nil {
 		return nil, err
@@ -356,7 +364,7 @@ func (s *Shell) StartCommand(command string, args []string, winrsConsoleModeStdi
 		messageID,
 		s.id,
 		winrsConsoleModeStdin,
-		false,
+		winrsSkipCmdShell,
 		command,
 		args,
 	)
@@ -465,6 +473,7 @@ func (c *Command) getOutputLoop() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
 		finished, exitCode, err := zenwinrm.ParseSlurpOutputErrResponse(responseBody, &stdout, &stderr)
+		log.Debugf("command(%s): got %d stderr bytes and %d stdout bytes, finished=%v, exitCode=%d", c.id, stderr.Len(), stdout.Len(), finished, exitCode)
 		c.stderr.Write(stderr.Bytes())
 		c.stdout.Write(stdout.Bytes())
 		if finished {

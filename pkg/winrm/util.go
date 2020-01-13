@@ -5,17 +5,27 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"io"
 	"os"
 	"sync"
 	"unicode"
 	"unicode/utf16"
+
+	log "github.com/sirupsen/logrus"
 )
 
-func FormatPowershellScriptCommandLine(script string) string {
+func FormatPowershellScriptCommandLine(script string) []string {
 	var scriptUTF16LE bytes.Buffer
 	for _, rune := range script {
+		// Change line terminators to \r\n
+		// if rune == '\n' {
+		// 	var codePoints [4]byte
+		// 	scriptUTF16LE.Grow(4)
+		// 	binary.LittleEndian.PutUint16(codePoints[0:2], '\r')
+		// 	binary.LittleEndian.PutUint16(codePoints[2:4], '\r')
+		// 	_, _ = scriptUTF16LE.Write(codePoints[:])
+		// 	continue
+		// }
 		r1, r2 := utf16.EncodeRune(rune)
 		if r2 == unicode.ReplacementChar {
 			if rune > unicode.MaxRune {
@@ -33,14 +43,16 @@ func FormatPowershellScriptCommandLine(script string) string {
 		}
 	}
 	scriptEncoded := base64.StdEncoding.EncodeToString(scriptUTF16LE.Bytes())
-	return "PowerShell -NoProfile -NonInteractive -ExecutionPolicy Unrestricted -EncodedCommand " + scriptEncoded
+	return []string{
+		"PowerShell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Unrestricted", "-EncodedCommand", scriptEncoded,
+	}
 }
 
-func RunCommand(shell *Shell, command string, args []string) error {
+func RunCommand(shell *Shell, command string, args []string, winrsConsoleModeStdin, winrsSkipCmdShell bool) error {
 	if shell == nil {
 		return fmt.Errorf("shell cannot be nil")
 	}
-	cmd, err := shell.StartCommand(command, nil, true)
+	cmd, err := shell.StartCommand(command, args, winrsConsoleModeStdin, winrsSkipCmdShell)
 	if err != nil {
 		return err
 	}
@@ -79,8 +91,8 @@ func RunCommand(shell *Shell, command string, args []string) error {
 }
 
 // MustRunCommand is a wrapper around RunCommand and panics with the error returned by RunCommand, if any.
-func MustRunCommand(shell *Shell, command string, args []string) {
-	err := RunCommand(shell, command, args)
+func MustRunCommand(shell *Shell, command string, args []string, winrsConsoleModeStdin, winrsSkipCmdShell bool) {
+	err := RunCommand(shell, command, args, winrsConsoleModeStdin, winrsSkipCmdShell)
 	if err != nil {
 		panic(fmt.Errorf("error while running command %+v: %v", append([]string{command}, args...), err))
 	}

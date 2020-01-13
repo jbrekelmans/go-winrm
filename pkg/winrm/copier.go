@@ -2,6 +2,9 @@ package winrm
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +20,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const pipeHasEnded = "The pipe has been ended."
+const pipeIsBeingClosed = "The pipe is being closed."
 const parentPrefix = ".." + string(os.PathSeparator)
 const shellUtilizationLogLevel = log.DebugLevel
 
@@ -144,10 +149,10 @@ func newWinrsWorker(f *FileTreeCopier, id int, shell *Shell) *winrsWorker {
 func (w *winrsWorker) RunCommand(command string) error {
 	log.Tracef(command)
 	if !log.IsLevelEnabled(shellUtilizationLogLevel) {
-		return RunCommand(w.shell, command, nil)
+		return RunCommand(w.shell, command, nil, true, false)
 	}
 	s := time.Now()
-	err := RunCommand(w.shell, command, nil)
+	err := RunCommand(w.shell, command, nil, true, false)
 	w.shellUseTime += time.Since(s)
 	return err
 }
@@ -387,43 +392,64 @@ func (f *FileTreeCopier) createMkdirTaskForRootOfFileTreeToCopy(localFile string
 }
 
 func (w *winrsWorker) copyFile(localFile, remoteFile string) error {
-	command := FormatPowershellScriptCommandLine(`begin {{
-		$path = "` + remoteFile + `"
-		$DebugPreference = "Continue"
-		$ErrorActionPreference = "Stop"
-		Set-StrictMode -Version 2
-		$fd = [System.IO.File]::Create($path)
-		$sha256 = [System.Security.Cryptography.SHA256CryptoServiceProvider]::Create()
-		$bytes = @() #initialize for empty file case
-	}}
-	process {{
-		$bytes = [System.Convert]::FromBase64String($input)
-		$sha256.TransformBlock($bytes, 0, $bytes.Length, $bytes, 0) | Out-Null
-		$fd.Write($bytes, 0, $bytes.Length)
-	}}
-	end {{
-		$sha256.TransformFinalBlock($bytes, 0, 0) | Out-Null
-		$hash = [System.BitConverter]::ToString($sha256.Hash).Replace("-", "").ToLowerInvariant()
-		$fd.Close()
-		Write-Output "{{""sha256"":""$hash""}}"
-	}}
-`)
-	log.Tracef(command)
-	s := time.Now()
-	cmd, err := w.shell.StartCommand(command, nil, false)
+	commandAndArgs := FormatPowershellScriptCommandLine(`begin {
+	$path = '` + remoteFile + `'
+	$DebugPreference = "Continue"
+	$ErrorActionPreference = "Stop"
+	Set-StrictMode -Version 2
+	$fd = [System.IO.File]::Create($path)
+	$sha256 = [System.Security.Cryptography.SHA256CryptoServiceProvider]::Create()
+	$bytes = @() #initialize for empty file case
+}
+process {
+	$bytes = [System.Convert]::FromBase64String($input)
+	$sha256.TransformBlock($bytes, 0, $bytes.Length, $bytes, 0) | Out-Null
+	$fd.Write($bytes, 0, $bytes.Length)
+}
+end {
+	$sha256.TransformFinalBlock($bytes, 0, 0) | Out-Null
+	$hash = [System.BitConverter]::ToString($sha256.Hash).Replace("-", "").ToLowerInvariant()
+	$fd.Close()
+	Write-Output "{""sha256"":""$hash""}"
+}`)
+	if log.IsLevelEnabled(log.TraceLevel) {
+		log.Tracef(strings.Join(commandAndArgs, " "))
+	}
+	stat, err := os.Lstat(localFile)
 	if err != nil {
 		return err
 	}
+	sha256DigestLocalComputer := sha256.New()
+	sha256DigestLocal := ""
+	sha256DigestRemote := ""
+	fileSize := stat.Size()
+	bytesCopied := int64(0)
+	fdClosed := false
 	fd, err := os.Open(localFile)
 	if err != nil {
 		return err
 	}
-	defer fd.Close()
-	client := w.shell.Client()
-	sendInputMax := client.SendInputMax()
-	buffer := make([]byte, sendInputMax)
+	defer func() {
+		if !fdClosed {
+			_ = fd.Close()
+			fdClosed = true
+		}
+	}()
+	s := time.Now()
+	cmd, err := w.shell.StartCommand(commandAndArgs[0], commandAndArgs[1:], false, true)
+	if err != nil {
+		return err
+	}
+	// Since we are passing data over a powershell pipe, we encode the data as lines of base64 (each line is terminated by a carriage return +
+	// line feed sequence, hence the -2)
+	bufferCapacity := (w.shell.Client().SendInputMax() - 2) / 4 * 3
+	base64LineBufferCapacity := bufferCapacity/3*4 + 2
+	base64LineBuffer := make([]byte, base64LineBufferCapacity)
+	base64LineBuffer[base64LineBufferCapacity-2] = '\r'
+	base64LineBuffer[base64LineBufferCapacity-1] = '\n'
+	buffer := make([]byte, bufferCapacity)
 	bufferLength := 0
-	var sendInputErr error
+	ended := false
 	for {
 		var n int
 		n, err = fd.Read(buffer)
@@ -431,29 +457,50 @@ func (w *winrsWorker) copyFile(localFile, remoteFile string) error {
 		if err != nil {
 			break
 		}
-		if bufferLength == sendInputMax {
-			err := cmd.SendInput(buffer, false)
+		if bufferLength == bufferCapacity {
+			base64.StdEncoding.Encode(base64LineBuffer, buffer)
+			bytesCopied += int64(bufferLength)
+			_, _ = sha256DigestLocalComputer.Write(buffer)
+			if bytesCopied >= fileSize {
+				ended = true
+				sha256DigestLocal = hex.EncodeToString(sha256DigestLocalComputer.Sum(nil))
+			}
+			err := cmd.SendInput(base64LineBuffer, ended)
 			atomic.AddInt64(&w.f.stats.bytesCopied, int64(bufferLength))
 			bufferLength = 0
 			if err != nil {
-				// we may replace sendInputErr here and hide ana error, but this is intentional
-				sendInputErr = err
+				w.f.addError(err)
 			}
 		}
 	}
+	fd.Close()
+	fdClosed = true
 	if err == io.EOF {
 		err = nil
 	}
 	if err != nil {
 		return err
 	}
-	err = cmd.SendInput(buffer[:bufferLength], true)
-	if err != nil {
-		// we may replace sendInputErr here and hide ana error, but this is intentional
-		sendInputErr = err
+	if !ended {
+		_, _ = sha256DigestLocalComputer.Write(buffer[:bufferLength])
+		sha256DigestLocal = hex.EncodeToString(sha256DigestLocalComputer.Sum(nil))
+		base64.StdEncoding.Encode(base64LineBuffer, buffer[:bufferLength])
+		i := base64.StdEncoding.EncodedLen(bufferLength)
+		base64LineBuffer[i] = '\r'
+		base64LineBuffer[i+1] = '\n'
+		err = cmd.SendInput(base64LineBuffer[:i+2], true)
+		if err != nil {
+			if !strings.Contains(err.Error(), pipeHasEnded) && !strings.Contains(err.Error(), pipeIsBeingClosed) {
+				cmd.Signal()
+				return err
+			}
+			// ignore pipe errors that results from passing true to cmd.SendInput
+		}
+		ended = true
+		bytesCopied += int64(bufferLength)
+		atomic.AddInt64(&w.f.stats.bytesCopied, int64(bufferLength))
+		bufferLength = 0
 	}
-	atomic.AddInt64(&w.f.stats.bytesCopied, int64(bufferLength))
-	bufferLength = 0
 	var wg sync.WaitGroup
 	wg.Add(2)
 	var errors []error
@@ -471,18 +518,12 @@ func (w *winrsWorker) copyFile(localFile, remoteFile string) error {
 	go func() {
 		scanner := bufio.NewScanner(cmd.Stdout)
 		for scanner.Scan() {
-			var hash struct {
+			os.Stdout.Write(append(scanner.Bytes(), '\n'))
+			var output struct {
 				Sha256 string `json:"sha256"`
 			}
-			// log.Debugf("got output line: %s", string(scanner.Bytes()))
-			err := json.Unmarshal(scanner.Bytes(), &hash)
-			if err == nil {
-				if sendInputErr != nil {
-					log.Infof("command(%s): ignored one or more send input errors because the command succeeded anyway", cmd.ID())
-				}
-				sendInputErr = nil
-			} else {
-				_, _ = os.Stdout.Write(append(scanner.Bytes(), '\n'))
+			if json.Unmarshal(scanner.Bytes(), &output) == nil {
+				sha256DigestRemote = output.Sha256
 			}
 		}
 		if scanner.Err() != nil {
@@ -500,11 +541,10 @@ func (w *winrsWorker) copyFile(localFile, remoteFile string) error {
 		errors = append(errors, err)
 		errorsMutex.Unlock()
 	}
-	time.Sleep(time.Second * 2)
 	wg.Wait()
 	w.shellUseTime += time.Since(s)
-	if sendInputErr != nil {
-		errors = append(errors, sendInputErr)
+	if sha256DigestRemote != sha256DigestLocal {
+		errors = append(errors, fmt.Errorf("local and remote checksum of file %#v, %s and %s, respectively, do not match", remoteFile, sha256DigestLocal, sha256DigestRemote))
 	}
 	err = nil
 	if len(errors) != 0 {
