@@ -1,7 +1,8 @@
 package winrm
 
 import (
-	"encoding/base64"
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -17,7 +18,6 @@ import (
 )
 
 const parentPrefix = ".." + string(os.PathSeparator)
-const dotBase64 = ".b64"
 const shellUtilizationLogLevel = log.DebugLevel
 
 var regexpRemoteFileThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9]:(?:\\|(?:\\[a-zA-Z0-9-_\. ^&]+)+)$`)
@@ -77,7 +77,7 @@ type FileTreeCopier struct {
 // with a drive letter.
 // Limitations:
 // 1. if localRoot is a regular file then the remote directory to which it would be copied must not contain an entry with a case-insensitive
-//    equal name, or a name case-insensitive equal to the base name of localRoot concatenated with .b64
+//    equal name.
 // 2. after cleaning localRoot (filepath.Clean), it should not contain any characters outside the regular expression class [a-zA-Z0-9-_\. ],
 //    because escaping such file names is not supported.
 func NewFileTreeCopier(shells []*Shell, scanDirWorkers int, remoteRoot, localRoot string) (*FileTreeCopier, error) {
@@ -121,7 +121,7 @@ func NewFileTreeCopier(shells []*Shell, scanDirWorkers int, remoteRoot, localRoo
 		return nil, err
 	}
 	f.winrsTaskQueue = make(chan *winrsTask, len(f.shells)*2)
-	f.scanDirTaskQueue = make(chan *scanDirTask, len(f.shells))
+	f.scanDirTaskQueue = make(chan *scanDirTask, 10000)
 	f.done = make(chan struct{})
 	return f, nil
 }
@@ -141,13 +141,13 @@ func newWinrsWorker(f *FileTreeCopier, id int, shell *Shell) *winrsWorker {
 	}
 }
 
-func (w *winrsWorker) RunCommand(commandAndArgs []string) error {
-	log.Tracef(commandAndArgs[0])
+func (w *winrsWorker) RunCommand(command string) error {
+	log.Tracef(command)
 	if !log.IsLevelEnabled(shellUtilizationLogLevel) {
-		return RunCommand(w.shell, commandAndArgs)
+		return RunCommand(w.shell, command, nil)
 	}
 	s := time.Now()
-	err := RunCommand(w.shell, commandAndArgs)
+	err := RunCommand(w.shell, command, nil)
 	w.shellUseTime += time.Since(s)
 	return err
 }
@@ -203,9 +203,6 @@ func (f *FileTreeCopier) addError(err error) {
 }
 
 func validateFileBasename(fileBasename string) error {
-	if strings.HasSuffix(fileBasename, dotBase64) {
-		return fmt.Errorf("basename of file system entry %#v has reserved suffix %#v", fileBasename, dotBase64)
-	}
 	if !regexpFileBasenameThatDoesNotNeedEscaping.MatchString(fileBasename) {
 		return fmt.Errorf("basename of file system entry %#v is not supported. The regexp used for "+
 			"validation is %s", fileBasename, regexpFileBasenameThatDoesNotNeedEscaping.String())
@@ -389,136 +386,134 @@ func (f *FileTreeCopier) createMkdirTaskForRootOfFileTreeToCopy(localFile string
 	}
 }
 
-type winrsFileCopier struct {
-	finalizeCommand          string
-	attemptedFinalizeCommand bool
-	localFile                string
-	remoteFile               string
-	remoteFileDotBase64      string
-	w                        *winrsWorker
-}
-
-func newWinrsFileCopier(w *winrsWorker, localFile, remoteFile string) *winrsFileCopier {
-	return &winrsFileCopier{
-		w:                   w,
-		localFile:           localFile,
-		remoteFile:          remoteFile,
-		remoteFileDotBase64: remoteFile + dotBase64,
-	}
-}
-
 func (w *winrsWorker) copyFile(localFile, remoteFile string) error {
-	return newWinrsFileCopier(w, localFile, remoteFile).Run()
-}
-
-func (w *winrsFileCopier) getFinalizeCommand() string {
-	if w.finalizeCommand == "" {
-		w.finalizeCommand = fmt.Sprintf(`certutil -decode "%s" "%s"&&del /q "%s"`, w.remoteFileDotBase64, w.remoteFile, w.remoteFileDotBase64)
+	command := FormatPowershellScriptCommandLine(`begin {{
+		$path = "` + remoteFile + `"
+		$DebugPreference = "Continue"
+		$ErrorActionPreference = "Stop"
+		Set-StrictMode -Version 2
+		$fd = [System.IO.File]::Create($path)
+		$sha256 = [System.Security.Cryptography.SHA256CryptoServiceProvider]::Create()
+		$bytes = @() #initialize for empty file case
+	}}
+	process {{
+		$bytes = [System.Convert]::FromBase64String($input)
+		$sha256.TransformBlock($bytes, 0, $bytes.Length, $bytes, 0) | Out-Null
+		$fd.Write($bytes, 0, $bytes.Length)
+	}}
+	end {{
+		$sha256.TransformFinalBlock($bytes, 0, 0) | Out-Null
+		$hash = [System.BitConverter]::ToString($sha256.Hash).Replace("-", "").ToLowerInvariant()
+		$fd.Close()
+		Write-Output "{{""sha256"":""$hash""}}"
+	}}
+`)
+	log.Tracef(command)
+	s := time.Now()
+	cmd, err := w.shell.StartCommand(command, nil, false)
+	if err != nil {
+		return err
 	}
-	return w.finalizeCommand
-}
-
-func (w *winrsFileCopier) Run() error {
-	numberOfChunksCopied := 0
-	maxCommandSize := w.w.shell.MaxSizeOfCommandWithZeroArguments()
-	commandPrefix := `echo `
-	// Used for every chunk except the first one.
-	commandSuffix1 := `>>"` + w.remoteFileDotBase64 + `"`
-	// Used for the first chunk.
-	commandSuffix2 := `>"` + w.remoteFileDotBase64 + `"`
-	maxChunkBase64Size := maxCommandSize - len(commandPrefix) - len(commandSuffix1)
-	// We split base64 data over a number of chunks, but as an optimization require base64 chunk sizes are multiples of 4.
-	// For the first chunk, maxChunkBase64Size is off by one character, but we do not care about this (see commandSuffix1 and commandSuffix2).
-	if maxChunkBase64Size < 4 {
-		return fmt.Errorf("envelope size is too small")
-	}
-	// The maximum number of bytes that can fit into one chunk.
-	maxChunkSize := maxChunkBase64Size / 4 * 3
-	// Add padding of 2 bytes so that we can rotate the readBuffer to ensure all chunks except the last encode multiples of 3
-	// bytes.
-	readBuffer := make([]byte, maxChunkSize+2)
-	readBufferLength := 0
-	commandBuffer := make([]byte, maxCommandSize)
-	copy(commandBuffer[0:len(commandPrefix)], commandPrefix)
-	fd, err := os.Open(w.localFile)
+	fd, err := os.Open(localFile)
 	if err != nil {
 		return err
 	}
 	defer fd.Close()
+	client := w.shell.Client()
+	sendInputMax := client.SendInputMax()
+	buffer := make([]byte, sendInputMax)
+	bufferLength := 0
+	var sendInputErr error
 	for {
-		n, err := fd.Read(readBuffer[readBufferLength:maxChunkSize])
-		readBufferLength += n
-		commandBufferSize := len(commandPrefix)
-		isEOF := false
+		var n int
+		n, err = fd.Read(buffer)
+		bufferLength += n
 		if err != nil {
-			if err != io.EOF {
-				return err
-			}
-			isEOF = true
-			if readBufferLength == 0 {
-				if numberOfChunksCopied == 0 {
-					return w.emptyFile()
-				}
-				break
-			}
-			base64.StdEncoding.Encode(commandBuffer[commandBufferSize:], readBuffer[:readBufferLength])
-			commandBufferSize += base64.StdEncoding.EncodedLen(readBufferLength)
-		} else {
-			readBufferLengthMod3 := readBufferLength % 3
-			base64.StdEncoding.Encode(commandBuffer[commandBufferSize:], readBuffer[:readBufferLength-readBufferLengthMod3])
-			commandBufferSize += base64.StdEncoding.EncodedLen(readBufferLength - readBufferLengthMod3)
-			atomic.AddInt64(&w.w.f.stats.bytesCopied, int64(readBufferLength-readBufferLengthMod3))
-			switch readBufferLengthMod3 {
-			case 0:
-				readBufferLength = 0
-			case 1:
-				readBuffer[0] = readBuffer[readBufferLength-1]
-				readBufferLength = 1
-			case 2:
-				readBuffer[0] = readBuffer[readBufferLength-2]
-				readBuffer[1] = readBuffer[readBufferLength-1]
-				readBufferLength = 2
-			}
-		}
-		if numberOfChunksCopied == 0 {
-			commandBufferSize += copy(commandBuffer[commandBufferSize:], commandSuffix2)
-		} else {
-			commandBufferSize += copy(commandBuffer[commandBufferSize:], commandSuffix1)
-		}
-		if isEOF {
-			if maxCommandSize-commandBufferSize >= 2+len(w.getFinalizeCommand()) {
-				commandBufferSize += copy(commandBuffer[commandBufferSize:], "&&")
-				commandBufferSize += copy(commandBuffer[commandBufferSize:], w.getFinalizeCommand())
-				w.attemptedFinalizeCommand = true
-			}
-		}
-		command := string(commandBuffer[:commandBufferSize])
-		err = w.w.RunCommand([]string{command})
-		numberOfChunksCopied++
-		if err != nil {
-			return err
-		}
-		if isEOF {
 			break
 		}
-	}
-	if !w.attemptedFinalizeCommand {
-		w.attemptedFinalizeCommand = true
-		err = w.w.RunCommand([]string{w.getFinalizeCommand()})
-		if err != nil {
-			return err
+		if bufferLength == sendInputMax {
+			err := cmd.SendInput(buffer, false)
+			atomic.AddInt64(&w.f.stats.bytesCopied, int64(bufferLength))
+			bufferLength = 0
+			if err != nil {
+				// we may replace sendInputErr here and hide ana error, but this is intentional
+				sendInputErr = err
+			}
 		}
 	}
-	return nil
-}
-
-func (w *winrsFileCopier) emptyFile() error {
-	command := fmt.Sprintf(`copy /y NUL "%s"`, w.remoteFile)
-	err := w.w.RunCommand([]string{command})
-	if err != nil {
-		return fmt.Errorf("error while creating empty file %#v: %w", w.remoteFile, err)
+	if err == io.EOF {
+		err = nil
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	err = cmd.SendInput(buffer[:bufferLength], true)
+	if err != nil {
+		// we may replace sendInputErr here and hide ana error, but this is intentional
+		sendInputErr = err
+	}
+	atomic.AddInt64(&w.f.stats.bytesCopied, int64(bufferLength))
+	bufferLength = 0
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var errors []error
+	var errorsMutex sync.Mutex
+	go func() {
+		_, err = io.Copy(os.Stderr, cmd.Stderr)
+		if err != nil {
+			errWrapped := fmt.Errorf("error while copying command's stderr to own stderr: %w", err)
+			errorsMutex.Lock()
+			errors = append(errors, errWrapped)
+			errorsMutex.Unlock()
+		}
+		wg.Done()
+	}()
+	go func() {
+		scanner := bufio.NewScanner(cmd.Stdout)
+		for scanner.Scan() {
+			var hash struct {
+				Sha256 string `json:"sha256"`
+			}
+			// log.Debugf("got output line: %s", string(scanner.Bytes()))
+			err := json.Unmarshal(scanner.Bytes(), &hash)
+			if err == nil {
+				if sendInputErr != nil {
+					log.Infof("command(%s): ignored one or more send input errors because the command succeeded anyway", cmd.ID())
+				}
+				sendInputErr = nil
+			} else {
+				_, _ = os.Stdout.Write(append(scanner.Bytes(), '\n'))
+			}
+		}
+		if scanner.Err() != nil {
+			errWrapped := fmt.Errorf("error while copying command's stdout to own stdout: %w", err)
+			errorsMutex.Lock()
+			errors = append(errors, errWrapped)
+			errorsMutex.Unlock()
+		}
+		wg.Done()
+	}()
+	cmd.Wait()
+	if cmd.ExitCode() != 0 {
+		err := fmt.Errorf("command unexpectedly exited with code %d", cmd.ExitCode())
+		errorsMutex.Lock()
+		errors = append(errors, err)
+		errorsMutex.Unlock()
+	}
+	time.Sleep(time.Second * 2)
+	wg.Wait()
+	w.shellUseTime += time.Since(s)
+	if sendInputErr != nil {
+		errors = append(errors, sendInputErr)
+	}
+	err = nil
+	if len(errors) != 0 {
+		err = errors[0]
+		for i := 1; i < len(errors); i++ {
+			log.Error(errors[i])
+		}
+	}
+	return err
 }
 
 func (w *winrsWorker) makeDirectories(remoteFile string, checkIfExists bool) error {
@@ -529,5 +524,5 @@ func (w *winrsWorker) makeDirectories(remoteFile string, checkIfExists bool) err
 	} else {
 		command = fmt.Sprintf(`md "%s"`, remoteFile)
 	}
-	return w.RunCommand([]string{command})
+	return w.RunCommand(command)
 }

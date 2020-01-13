@@ -1,7 +1,13 @@
 # TODO
-
-1. change implementation to not rely on cmd.exe, but use powershell to create a filestream and base64 decode on the fly (this eliminates .b64 restriction and should increase throughput on server)
+1. fix issue of sendInput to closed pipe
+1. fix deadlock bug where both shell copiers and dirscanners are waiting for each other
+1. increase throughput by:
+    1. allowing sending of commands before receiving response: handle responses on separate goroutines
+    1. add throttling in the form of maximum number of requests...
+    1. this requires a new abstraction (WinrmHighThroughputConnection)
+1. use compression
 1. upload single file in parallel
+    1. use emperical evidence to determine how a file can best be broken up (overhead versus gain) 
 
 1. measure file copy rate
 1. measure time it takes until all directories are created (to possibly optimize bootstrapping)
