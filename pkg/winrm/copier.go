@@ -338,11 +338,26 @@ func (f *FileTreeCopier) Run() error {
 	f.done <- struct{}{}
 	elapsedSeconds := time.Since(f.stats.startTime).Seconds()
 	overallBytesPerSecond := float64(f.stats.bytesCopied) / elapsedSeconds
-	log.Infof("copied file tree with %d errors in %2f seconds (upload speed = %.0f bytes per second)", len(f.errors), elapsedSeconds, overallBytesPerSecond)
+	log.Infof("copied file tree with %d errors in %2f seconds (upload speed = %s/s)", len(f.errors), elapsedSeconds, formatBytes(overallBytesPerSecond))
 	if len(f.errors) == 0 {
 		return nil
 	}
 	return f.errors[0]
+}
+
+func formatBytes(bytes float64) string {
+	units := []string{
+		"bytes",
+		"KiB",
+		"MiB",
+		"GiB",
+	}
+	power := 0
+	for bytes > 1024.0 && power < len(units) {
+		bytes /= 1024.0
+		power++
+	}
+	return fmt.Sprintf("%.3f %s", bytes, units[power])
 }
 
 func (f *FileTreeCopier) reportLoop() {
@@ -358,7 +373,7 @@ func (f *FileTreeCopier) reportLoop() {
 			f.stats.lastReportBytesCopied = v
 			f.stats.lastReportTime = now
 			bytesCopiedPerSecond := float64(bytesCopied) / elapsedTime.Seconds()
-			log.Infof("stats: upload speed = %.0f bytes per second", bytesCopiedPerSecond)
+			log.Infof("stats: upload speed = %s/s", formatBytes(bytesCopiedPerSecond))
 		}
 	}
 	log.Debugf("reportLoop: goroutine finishing")
