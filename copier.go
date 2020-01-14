@@ -297,8 +297,7 @@ outer:
 		select {
 		case <-f.done:
 			break outer
-		case <-time.After(time.Second * 5):
-			now := time.Now()
+		case now := <-time.After(time.Second * 5):
 			bytesCopied := atomic.LoadInt64(&f.stats.bytesCopied)
 			bytesCopiedChange := bytesCopied - f.stats.lastReportBytesCopied
 			elapsedTime := now.Sub(f.stats.lastReportTime)
