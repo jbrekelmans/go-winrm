@@ -16,18 +16,23 @@ import (
 	"unsafe"
 
 	"github.com/gofrs/uuid"
-	soap "github.com/jbrekelmans/go-winrm-fast/pkg/winrm/soap"
+	soap "github.com/jbrekelmans/winrm/soap"
 	zenwinrm "github.com/masterzen/winrm"
 	zensoap "github.com/masterzen/winrm/soap"
 	log "github.com/sirupsen/logrus"
 )
 
+// MaxCommandLineSize is not really useful. TODO https://github.com/jbrekelmans/go-winrm/issues/7 make this more useful.
 const MaxCommandLineSize = 8191
 const zeroUUID = "00000000-0000-0000-0000-000000000000"
 
 // See init to learn why this exists.
 var dummyEndpoint = zenwinrm.NewEndpoint("", 0, true, false, nil, nil, nil, 0)
 
+// Client contains:
+// 1. a HTTP client and context for HTTP requests made with that client.
+// 2. default parameters for SOAP headers.
+// 3. Credentials used to authenticate with WinRM.
 type Client struct {
 	ctx                            context.Context
 	httpClient                     *http.Client
@@ -40,13 +45,18 @@ type Client struct {
 	zenParams                      *zenwinrm.Parameters
 }
 
+// NewClient returns a *Client and guards against some erroneous inputs.
+// To use basic authentication, set password to a non-empty string.
+// If password is the empty string, then client will not pass a basic authentiction header to HTTP requests,
+// but other authentication mechanisms can still be implemented in the supplied HTTP client.
 func NewClient(
+	// ctx is not respected by shells associated with this client, or commands associated with such shells, but only by HTTP requests.
+	ctx context.Context,
 	useTLS bool,
 	host string,
 	port int,
 	user, password string,
 	httpClient *http.Client,
-	ctx context.Context,
 	maxEnvelopeSize *int) (*Client, error) {
 	c := &Client{
 		ctx:                            ctx,
@@ -72,15 +82,6 @@ func NewClient(
 	}
 	c.sendInputMax = c.computeSendInputMax()
 	return c, nil
-}
-
-// FormatURL formats the HTTP URL for Windows server remote management.
-func FormatURL(useTLS bool, host string, port int) string {
-	scheme := "http"
-	if useTLS {
-		scheme = "https"
-	}
-	return fmt.Sprintf("%s://%s:%d/wsman", scheme, host, port)
 }
 
 // See init to learn why this adapter exists.
@@ -128,6 +129,8 @@ func (c *Client) init(maxEnvelopeSize *int) error {
 	return err
 }
 
+// doPostErrorResponse is an implementation of the error interface that can be used to optionally parse SOAP payloads in HTTP responses with
+// non-2xx status.
 type doPostErrorResponse struct {
 	Method       string
 	URL          string
@@ -150,7 +153,9 @@ func (c *Client) doPost(requestBody string) (string, error) {
 		return "", fmt.Errorf("error creating request %s %#v: %w", method, c.url, err)
 	}
 	req.Header.Set("Content-Type", soap.MimeType+";charset=UTF-8")
-	req.SetBasicAuth(c.user, c.password)
+	if c.password != "" {
+		req.SetBasicAuth(c.user, c.password)
+	}
 	res, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("error doing HTTP request %s %#v: %w", method, c.url, err)
@@ -206,21 +211,19 @@ func (c *Client) CreateShell() (*Shell, error) {
 	}
 	id := getID(zenShell)
 	requestBody := soap.StartCommandRequest(c.URL(), c.zenParams.EnvelopeSize, c.defaultOperationTimeoutSeconds, uuid.UUID{}, id, false, false, "", nil)
+	// TODO https://github.com/jbrekelmans/go-winrm/issues/7 this seems to be incorrectly calculated
+	maxSizeOfCommandWithZeroArguments := MaxCommandLineSize - len(requestBody)
 	log.Debugf("created remote winrm shell %#v", id)
 	return &Shell{
 		c:                                 c,
 		id:                                id,
-		maxSizeOfCommandWithZeroArguments: MaxCommandLineSize - len(requestBody),
+		maxSizeOfCommandWithZeroArguments: maxSizeOfCommandWithZeroArguments,
 		zenShell:                          zenShell,
 	}, nil
 }
 
-func (s *Shell) MaxSizeOfCommandWithZeroArguments() int {
-	return s.maxSizeOfCommandWithZeroArguments
-}
-
-// SendInputMax returns the maximum value number of bytes (with this client's settings) that can be sent in one
-// request.
+// SendInputMax returns the maximum value number of bytes that can be sent in one
+// request, given the current settings of c.
 func (c *Client) SendInputMax() int {
 	return c.sendInputMax
 }
@@ -233,7 +236,7 @@ func (c *Client) computeSendInputMax() int {
 	return sendInputMaxBase64 / 4 * 3
 }
 
-// URL returns the remote management URL associated with this client.
+// URL returns the WinRM URL associated with this client.
 func (c *Client) URL() string {
 	return c.url
 }
@@ -245,7 +248,7 @@ func (c *Client) ZenParametersConst() *zenwinrm.Parameters {
 	return c.zenParams
 }
 
-// Shell is a wrapper for "github.com/masterzen/winrm".Shell
+// Shell represents a WinRM remote shell. See (*Client).CreateShell.
 type Shell struct {
 	c                                 *Client
 	maxSizeOfCommandWithZeroArguments int
@@ -253,12 +256,19 @@ type Shell struct {
 	id                                string
 }
 
-// Client returns the *Client associated with this Shell
+// MaxSizeOfCommandWithZeroArguments returns the length of the longest command that can be passed to c.StartCommand, assuming zero
+// arguments.
+func (s *Shell) MaxSizeOfCommandWithZeroArguments() int {
+	return s.maxSizeOfCommandWithZeroArguments
+}
+
+// Client returns the *Client associated with this shell. All commands created from this Shell perform HTTP requests
+// using this client.
 func (s *Shell) Client() *Client {
 	return s.c
 }
 
-// Close is a wrapper that calls (*"github.com/masterzen/winrm".Shell).Close on the wrapped *"github.com/masterzen/winrm".Shell
+// Close deletes the remote shell.
 func (s *Shell) Close() error {
 	err := s.zenShell.Close()
 	if err == nil {
@@ -272,13 +282,6 @@ func (s *Shell) ID() string {
 	return s.id
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 type commandReader struct {
 	buffer  []byte
 	err     error
@@ -290,6 +293,7 @@ type commandReader struct {
 func newCommandReader() *commandReader {
 	c := &commandReader{}
 	c.hasData = sync.NewCond(&c.mutex)
+	// We use a finalizer to ensure we can log errors instead of silently ignoring them, in some edge cases.
 	runtime.SetFinalizer(c, (*commandReader).onFinalize)
 	return c
 }
@@ -302,6 +306,8 @@ func (c *commandReader) onFinalize() {
 	}
 }
 
+// Read writes up to len(p) bytes from the remote command's output stream (stdout or stderr) to p.
+// n is the number of bytes read. See io.Reader for more information on the contract.
 func (c *commandReader) Read(p []byte) (n int, err error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -356,6 +362,9 @@ type commandWriter struct {
 	c *Command
 }
 
+// StartCommand starts a command on the remote shell.
+// winrsConsoleModeStdin and winrsSkipCmdShell correspond to the SOAP options WINRS_CONSOLEMODE_STDIN and WINRS_SKIP_CMD_SHELL, respectively,
+// and are defined here: https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-wsmv/c793e333-c409-43c6-a2eb-6ae2489c7ef4
 func (s *Shell) StartCommand(command string, args []string, winrsConsoleModeStdin, winrsSkipCmdShell bool) (*Command, error) {
 	messageID, err := uuid.NewV4()
 	if err != nil {
@@ -395,6 +404,7 @@ func (s *Shell) StartCommand(command string, args []string, winrsConsoleModeStdi
 	return cmd, nil
 }
 
+// Command represents a command running in a remote cmd.exe terminal, and should not be used directly. See (*Shell).StartCommand.
 type Command struct {
 	errorCount int64
 	err        error
@@ -404,23 +414,30 @@ type Command struct {
 	stdout     *commandReader
 	stderr     *commandReader
 	stdin      *commandWriter
-	Stdout     io.Reader
-	Stderr     io.Reader
+	// Stdout is an io.Reader representing the remote command's stdout.
+	Stdout io.Reader
+	// Stderr is an io.Reader representing the remote command's stderr.
+	Stderr io.Reader
 }
 
+// SendInput copies bytes to the remote command's stdin. Set end to true to close the command process' stdin.
+// len(p) must be at most c.Shell().Client().SendInputMax(). It is up to caller to ensure len(p) is not too
+// large.
 func (c *Command) SendInput(p []byte, end bool) error {
+	client := c.shell.Client()
+	if len(p) > client.SendInputMax() {
+		return fmt.Errorf("p is too large")
+	}
 	messageID, err := uuid.NewV4()
 	if err != nil {
 		return fmt.Errorf("error generating uuid: %w", err)
 	}
-	client := c.shell.Client()
-	inputLength := min(len(p), client.SendInputMax())
 	requestBody := soap.SendInputRequest(
 		client.URL(), client.ZenParametersConst().EnvelopeSize,
 		client.defaultOperationTimeoutSeconds, messageID,
-		c.shell.ID(), c.id, p[:inputLength],
+		c.shell.ID(), c.id, p,
 		end)
-	log.Debugf("command(%s): sending %d bytes of input (end = %v)", c.id, inputLength, end)
+	log.Debugf("command(%s): sending %d bytes of input (end = %v)", c.id, len(p), end)
 	_, err = client.doPost(requestBody)
 	if err != nil {
 		return fmt.Errorf("error sending input to command %s: %w", c.id, err)
@@ -428,14 +445,18 @@ func (c *Command) SendInput(p []byte, end bool) error {
 	return nil
 }
 
+// ExitCode returns the exit code of the remote command, or -1 if it has not yet terminated.
+// Use Wait to wait for the remote command to terminate.
 func (c *Command) ExitCode() int {
 	return int(atomic.LoadInt64(&c.exitCode))
 }
 
+// ID returns the WinRM identifier of this command.
 func (c *Command) ID() string {
 	return c.id
 }
 
+// Signal sends a termination signal to the remote command.
 func (c *Command) Signal() {
 	client := c.shell.Client()
 	requestBody := zenwinrm.NewSignalRequest(client.URL(), c.shell.ID(), c.ID(), client.ZenParametersConst())
@@ -443,6 +464,7 @@ func (c *Command) Signal() {
 	client.doPost(requestBody.String())
 }
 
+// Shell returns the Shell from which this command was started.
 func (c *Command) Shell() *Shell {
 	return c.shell
 }
@@ -506,6 +528,7 @@ func (c *Command) getOutputLoop() {
 	}
 }
 
+// Wait slurps output from the remote command's stdout and stderr buffers, and waits for the remote command to terminate.
 func (c *Command) Wait() error {
 	c.getOutputLoop()
 	return c.err

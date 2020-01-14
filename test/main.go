@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/jbrekelmans/go-winrm-fast/pkg/winrm"
+	"github.com/jbrekelmans/winrm"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -30,7 +30,7 @@ func main() {
 			},
 		},
 	}
-	c, err := winrm.NewClient(useTLS, host, port, user, password, httpClient, context.Background(), &maxEnvelopeSize)
+	c, err := winrm.NewClient(context.Background(), useTLS, host, port, user, password, httpClient, &maxEnvelopeSize)
 	if err != nil {
 		log.Fatalf("error while initializing winrm client: %v", err)
 	}
