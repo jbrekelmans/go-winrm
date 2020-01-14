@@ -140,13 +140,11 @@ func (w *copyFileWorker) Run() {
 		if !ok {
 			break
 		}
-		remoteFile := w.f.getRemoteFile(t.LocalFile)
-		err := w.copyFile(t.LocalFile, remoteFile)
+		err := w.copyFile(t.LocalFile)
 		if err != nil {
 			log.Errorf("cp %#v failed: %v", t.LocalFile, err)
 			w.f.addError(err)
 		}
-		w.f.waitGroup.Done()
 	}
 	if log.IsLevelEnabled(shellUtilizationLogLevel) {
 		elapsedTime := time.Since(startTime)
@@ -326,7 +324,9 @@ func (f *FileTreeCopier) getRemoteFile(localFile string) string {
 	return remoteFile
 }
 
-func (w *copyFileWorker) copyFile(localFile, remoteFile string) error {
+func (w *copyFileWorker) copyFile(localFile string) error {
+	defer w.f.waitGroup.Done()
+	remoteFile := w.f.getRemoteFile(localFile)
 	commandAndArgs := FormatPowershellScriptCommandLine(`begin {
 	$path = '` + remoteFile + `'
 	$DebugPreference = "Continue"
