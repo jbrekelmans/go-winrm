@@ -77,7 +77,7 @@ func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTree
 	if len(shells) < 1 {
 		return nil, fmt.Errorf("shells cannot be empty")
 	}
-	uniqueShells := map[*Shell]bool{}
+	uniqueShells := map[*Shell]struct{}{}
 	for i, shell := range shells {
 		if shell == nil {
 			return nil, fmt.Errorf("shells contains a nil shell")
@@ -85,7 +85,7 @@ func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTree
 		if _, ok := uniqueShells[shell]; ok {
 			return nil, fmt.Errorf("shells contains duplicate shell objects")
 		}
-		uniqueShells[shell] = true
+		uniqueShells[shell] = struct{}{}
 		f.shells[i] = shell
 	}
 	if filepath.IsAbs(f.localRoot) {
@@ -297,8 +297,7 @@ outer:
 		select {
 		case <-f.done:
 			break outer
-		case <-time.After(time.Second * 5):
-			now := time.Now()
+		case now := <-time.After(time.Second * 5):
 			bytesCopied := atomic.LoadInt64(&f.stats.bytesCopied)
 			bytesCopiedChange := bytesCopied - f.stats.lastReportBytesCopied
 			elapsedTime := now.Sub(f.stats.lastReportTime)
