@@ -333,8 +333,8 @@ func (f *FileTreeCopier) getRemoteFile(localFile string) string {
 func (w *copyFileWorker) copyFile(localFile string) error {
 	defer w.f.waitGroup.Done()
 	remoteFile := w.f.getRemoteFile(localFile)
-	commandAndArgs := FormatPowershellScriptCommandLine(`begin {
-	$path = '` + remoteFile + `'
+	commandAndArgs := FormatPowerShellScriptCommandLine(`begin {
+	$path = ` + PowerShellSingleQuotedStringLiteral(remoteFile) + `
 	$DebugPreference = "Continue"
 	$ErrorActionPreference = "Stop"
 	Set-StrictMode -Version 2
