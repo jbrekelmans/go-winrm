@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"bufio"
@@ -41,7 +41,12 @@ func (p *winrmConfigParser) isEndOfLine() bool {
 // parseLine is a wrapper around parseLineCore that converts panics of encoding errors into a return value.
 // One could say we abuse panics to simplify parsing code.
 func (p *winrmConfigParser) parseLine() (err error) {
+	// returning is a flag used to to distinguish between no panic and panic(nil)
+	returning := false
 	defer func() {
+		if returning {
+			return
+		}
 		panicVal := recover()
 		if panicVal == encodingError {
 			if err == nil {
@@ -52,6 +57,7 @@ func (p *winrmConfigParser) parseLine() (err error) {
 		panic(panicVal)
 	}()
 	err = p.parseLineCore()
+	returning = true
 	return
 }
 
@@ -63,7 +69,7 @@ func (p *winrmConfigParser) parseLineCore() error {
 			break
 		}
 		indentChars++
-		p.lineAdvance()
+		p.advanceWithinLine()
 	}
 	if p.isEndOfLine() {
 		return nil
@@ -74,28 +80,42 @@ func (p *winrmConfigParser) parseLineCore() error {
 	tokenStart := p.linePos
 	// TODO check indent error here...
 	for {
-		p.lineAdvance()
+		p.advanceWithinLine()
 		if p.isEndOfLine() {
-			token := p.line[tokenStart:p.linePos]
-			// TODO this is a key-value pair of type object
-			log.Print(token)
+			key := string(p.line[tokenStart:p.linePos])
+			log.Debugf("parsed key %#v (object start)", key)
 			return nil
 		}
+		if p.rune == '=' || unicode.IsSpace(p.rune) {
+			break
+		}
 	}
-	// 3. check indent (error if indent per level does not match, create indent)
-	// 4. read sequence of any char except space, tab, \n and =
-	// 5. skip longest white space sequence (space and tab)
-	// 6. if = then skip and
-	//		6a. skip longest white space sequence
-	//		6b. read sequence of any char except space, tab and \n
-	//      6c. parse property value into bool (true or false), int (^[0-9]+$) or string (other)
-	//      6d. if property is already set on parent object...
-	// 7. else
-	//	    7a. if next character is not \n then abort with error
-	// 		7b. value is an empty object (map[string]interface{})
+	key := string(p.line[tokenStart:p.linePos])
+	for {
+		p.advanceWithinLine()
+		if p.isEndOfLine() {
+			return fmt.Errorf("line has only white space after equal sign, but expected a value")
+		}
+		if !unicode.IsSpace(p.rune) {
+			break
+		}
+	}
+	tokenStart = p.linePos
+	for {
+		p.advanceWithinLine()
+		if p.isEndOfLine() {
+			break
+		}
+	}
+	value := string(p.line[tokenStart:p.linePos])
+
+	// TODO parse value from any non-white space sequence
+	log.Debugf("parsed key value pair %#v = %#v", key, value)
+
+	return fmt.Errorf("not implemented")
 }
 
-func (p *winrmConfigParser) lineAdvance() {
+func (p *winrmConfigParser) advanceWithinLine() {
 	p.setLinePos(p.linePos + p.runeSize)
 }
 
@@ -128,4 +148,9 @@ func (p *winrmConfigParser) Run() (*winrmConfig, error) {
 		}
 	}
 	return nil, fmt.Errorf("not implemented: constructing return value")
+}
+
+// Parse parses output structured like winrm get winrm/config
+func Parse(r io.Reader) (interface{}, error) {
+	return newWinrmConfigParser(r).Run()
 }
