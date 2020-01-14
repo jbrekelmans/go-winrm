@@ -18,10 +18,10 @@ func main() {
 	shellCount := 5
 	useTLS := true
 	maxEnvelopeSize := 500 * 1000
-	host := "35.201.4.189"
+	host := ""
 	port := 5986
-	user := "jasper_brekelmans"
-	password := "H$AiU.}PX1|Isu$"
+	user := ""
+	password := ""
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			MaxConnsPerHost: 300,
