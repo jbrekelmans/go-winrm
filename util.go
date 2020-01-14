@@ -71,11 +71,11 @@ func RunCommand(shell *Shell, command string, args []string, winrsConsoleModeStd
 		}
 	}
 	copyFunc := func(dst io.Writer, src io.Reader, name string) {
+		defer wg.Done()
 		_, err = io.Copy(dst, src)
 		if err != nil {
 			addError(fmt.Errorf("error while copying command's %s to own %s: %w", name, name, err))
 		}
-		wg.Done()
 	}
 	go copyFunc(os.Stderr, cmd.Stderr, "stderr")
 	go copyFunc(os.Stdout, cmd.Stdout, "stdout")
