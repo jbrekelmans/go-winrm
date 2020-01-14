@@ -26,6 +26,12 @@ import (
 const MaxCommandLineSize = 8191
 const zeroUUID = "00000000-0000-0000-0000-000000000000"
 
+// LogFieldShellID is the name of the field containing the WinRM Shell identifier.
+const LogFieldShellID = "shell_id"
+
+// LogFieldCommandID is the name of the field containing the WinRM Command identifier.
+const LogFieldCommandID = "cmd_id"
+
 // See init to learn why this exists.
 var dummyEndpoint = zenwinrm.NewEndpoint("", 0, true, false, nil, nil, nil, 0)
 
@@ -165,7 +171,11 @@ func (c *Client) doPost(requestBody string) (string, error) {
 		var errorInfo strings.Builder
 		_, err = io.Copy(&errorInfo, res.Body)
 		if err != nil && err != io.EOF {
-			log.Errorf("error while reading response body of HTTP request %s %#v: %v", method, c.url, err)
+			log.WithFields(log.Fields{
+				"method":     method,
+				"url":        c.url,
+				log.ErrorKey: err.Error(),
+			}).Errorf("error while reading response body of HTTP request")
 		}
 		return "", &doPostErrorResponse{
 			Method:       method,
@@ -213,7 +223,9 @@ func (c *Client) CreateShell() (*Shell, error) {
 	requestBody := soap.StartCommandRequest(c.URL(), c.zenParams.EnvelopeSize, c.defaultOperationTimeoutSeconds, uuid.UUID{}, id, false, false, "", nil)
 	// TODO https://github.com/jbrekelmans/go-winrm/issues/7 this seems to be incorrectly calculated
 	maxSizeOfCommandWithZeroArguments := MaxCommandLineSize - len(requestBody)
-	log.Debugf("created remote winrm shell %#v", id)
+	log.WithFields(log.Fields{
+		LogFieldShellID: id,
+	}).Debugf("created remote winrm shell")
 	return &Shell{
 		c:                                 c,
 		id:                                id,
@@ -272,7 +284,9 @@ func (s *Shell) Client() *Client {
 func (s *Shell) Close() error {
 	err := s.zenShell.Close()
 	if err == nil {
-		log.Debugf("deleted remote winrm shell %#v", s.id)
+		log.WithFields(log.Fields{
+			LogFieldShellID: s.id,
+		}).Debugf("deleted remote winrm shell")
 	}
 	return err
 }
@@ -302,7 +316,9 @@ func (c *commandReader) onFinalize() {
 	if c.err != nil {
 		err := c.err
 		c.err = nil
-		log.Errorf("reporting otherwise hidden error in finalizer of *commandReader: %v", err)
+		log.WithFields(log.Fields{
+			log.ErrorKey: err.Error(),
+		}).Errorf("reporting otherwise hidden error in finalizer of *commandReader")
 	}
 }
 
@@ -391,7 +407,9 @@ func (s *Shell) StartCommand(command string, args []string, winrsConsoleModeStdi
 	if err != nil {
 		return nil, err
 	}
-	log.Debugf("command(%s): started", commandID)
+	log.WithFields(log.Fields{
+		LogFieldCommandID: commandID,
+	}).Debugf("started")
 	cmd := &Command{
 		exitCode: -1,
 		id:       commandID,
@@ -437,7 +455,11 @@ func (c *Command) SendInput(p []byte, end bool) error {
 		client.defaultOperationTimeoutSeconds, messageID,
 		c.shell.ID(), c.id, p,
 		end)
-	log.Debugf("command(%s): sending %d bytes of input (end = %v)", c.id, len(p), end)
+
+	log.WithFields(log.Fields{
+		LogFieldCommandID: c.id,
+		"end":             end,
+	}).Debugf("sending %d bytes of input", len(p))
 	_, err = client.doPost(requestBody)
 	if err != nil {
 		return fmt.Errorf("error sending input to command %s: %w", c.id, err)
@@ -460,7 +482,9 @@ func (c *Command) ID() string {
 func (c *Command) Signal() {
 	client := c.shell.Client()
 	requestBody := zenwinrm.NewSignalRequest(client.URL(), c.shell.ID(), c.ID(), client.ZenParametersConst())
-	log.Debugf("command(%s): sending signal", c.id)
+	log.WithFields(log.Fields{
+		LogFieldCommandID: c.id,
+	}).Debugf("sending signal")
 	client.doPost(requestBody.String())
 }
 
@@ -472,14 +496,19 @@ func (c *Command) Shell() *Shell {
 func (c *Command) closeStdoutAndStderr(err error, logError bool) {
 	c.stdout.Close(err)
 	if !c.stderr.Close(err) && logError && err != nil {
-		log.Errorf("error while getting output of command: %v", err)
+		log.WithFields(log.Fields{
+			LogFieldCommandID: c.id,
+			log.ErrorKey:      err.Error(),
+		}).Debugf("error while getting output of command")
 	}
 }
 
 func (c *Command) completed(exitCode int, err error, logError bool) {
 	atomic.StoreInt64(&c.exitCode, int64(exitCode))
 	c.closeStdoutAndStderr(err, logError)
-	log.Debugf("command(%s): completed with exit code %d and %d error(s)", c.id, exitCode, atomic.LoadInt64(&c.errorCount))
+	log.WithFields(log.Fields{
+		LogFieldCommandID: c.id,
+	}).Debugf("completed with exit code %d and %d error(s)", exitCode, atomic.LoadInt64(&c.errorCount))
 }
 
 func (c *Command) getOutputLoop() {
@@ -487,7 +516,9 @@ func (c *Command) getOutputLoop() {
 		client := c.shell.Client()
 		requestBody := zenwinrm.NewGetOutputRequest(client.URL(), c.shell.ID(), c.ID(), "stdout stderr", client.ZenParametersConst())
 		requestBodyString := requestBody.String()
-		log.Debugf("command(%s): getting output", c.id)
+		log.WithFields(log.Fields{
+			LogFieldCommandID: c.id,
+		}).Debugf("getting output")
 		responseBody, err := client.doPost(requestBodyString)
 		if err != nil {
 			if strings.Contains(err.Error(), "OperationTimeout") {
@@ -500,11 +531,16 @@ func (c *Command) getOutputLoop() {
 		}
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		finished, exitCode, err := zenwinrm.ParseSlurpOutputErrResponse(responseBody, &stdout, &stderr)
-		log.Debugf("command(%s): got %d stderr bytes and %d stdout bytes, finished=%v, exitCode=%d", c.id, stderr.Len(), stdout.Len(), finished, exitCode)
+		ended, exitCode, err := zenwinrm.ParseSlurpOutputErrResponse(responseBody, &stdout, &stderr)
+
+		log.WithFields(log.Fields{
+			LogFieldCommandID: c.id,
+			"exit_code":       exitCode,
+			"ended":           ended,
+		}).Debugf("got %d stderr bytes and %d stdout bytes", stderr.Len(), stdout.Len())
 		c.stderr.Write(stderr.Bytes())
 		c.stdout.Write(stdout.Bytes())
-		if finished {
+		if ended {
 			logError := false
 			if err != nil {
 				atomic.AddInt64(&c.errorCount, 1)
@@ -520,7 +556,10 @@ func (c *Command) getOutputLoop() {
 		}
 		if err != nil {
 			if c.err != nil {
-				log.Errorf("error parsing output response for command %s: %v", c.id, c.err)
+				log.WithFields(log.Fields{
+					LogFieldCommandID: c.id,
+					log.ErrorKey:      c.err.Error(),
+				}).Errorf("error parsing output response for command")
 			}
 			c.err = err
 			atomic.AddInt64(&c.errorCount, 1)

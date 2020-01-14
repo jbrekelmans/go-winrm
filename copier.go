@@ -25,6 +25,8 @@ const pipeHasEnded = "The pipe has been ended."
 const pipeIsBeingClosed = "The pipe is being closed."
 const parentPrefix = ".." + string(os.PathSeparator)
 const shellUtilizationLogLevel = log.DebugLevel
+const logFieldLocalFile = "file"
+const logFieldCopyFileWorker = "worker"
 
 var regexpRemoteFileThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9]:(?:\\|(?:\\[a-zA-Z0-9-_\. ^&]+)+)$`)
 var regexpFileBasenameThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9-_\. ^&]+$`)
@@ -75,7 +77,7 @@ func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTree
 	if len(shells) < 1 {
 		return nil, fmt.Errorf("shells cannot be empty")
 	}
-	uniqueShells := map[*Shell]bool{}
+	uniqueShells := map[*Shell]struct{}{}
 	for i, shell := range shells {
 		if shell == nil {
 			return nil, fmt.Errorf("shells contains a nil shell")
@@ -83,7 +85,7 @@ func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTree
 		if _, ok := uniqueShells[shell]; ok {
 			return nil, fmt.Errorf("shells contains duplicate shell objects")
 		}
-		uniqueShells[shell] = true
+		uniqueShells[shell] = struct{}{}
 		f.shells[i] = shell
 	}
 	if filepath.IsAbs(f.localRoot) {
@@ -140,19 +142,23 @@ func (w *copyFileWorker) Run() {
 		if !ok {
 			break
 		}
-		remoteFile := w.f.getRemoteFile(t.LocalFile)
-		err := w.copyFile(t.LocalFile, remoteFile)
+		err := w.copyFile(t.LocalFile)
 		if err != nil {
-			log.Errorf("cp %#v failed: %v", t.LocalFile, err)
+			log.WithFields(log.Fields{
+				log.ErrorKey:           err.Error(),
+				logFieldLocalFile:      t.LocalFile,
+				logFieldCopyFileWorker: w.id,
+			}).Errorf("copy file failed")
 			w.f.addError(err)
 		}
-		w.f.waitGroup.Done()
 	}
 	if log.IsLevelEnabled(shellUtilizationLogLevel) {
 		elapsedTime := time.Since(startTime)
 		elapsedSeconds := elapsedTime.Seconds()
 		shellUsePercentage := w.shellUseTime.Seconds() / elapsedSeconds * 100.0
-		log.StandardLogger().Logf(shellUtilizationLogLevel, "copyFileWorker(%d): goroutine finishing in %.2f seconds (shell utilization %.2f%%)", w.id, elapsedSeconds, shellUsePercentage)
+		log.StandardLogger().WithFields(log.Fields{
+			logFieldCopyFileWorker: w.id,
+		}).Logf(shellUtilizationLogLevel, "goroutine ran for %.2f seconds with a shell utilization of %.2f%%", elapsedSeconds, shellUsePercentage)
 	}
 }
 
@@ -291,8 +297,7 @@ outer:
 		select {
 		case <-f.done:
 			break outer
-		case <-time.After(time.Second * 5):
-			now := time.Now()
+		case now := <-time.After(time.Second * 5):
 			bytesCopied := atomic.LoadInt64(&f.stats.bytesCopied)
 			bytesCopiedChange := bytesCopied - f.stats.lastReportBytesCopied
 			elapsedTime := now.Sub(f.stats.lastReportTime)
@@ -308,7 +313,6 @@ outer:
 			)
 		}
 	}
-	log.Debugf("reportLoop: goroutine finishing")
 }
 
 func (f *FileTreeCopier) getRemoteFile(localFile string) string {
@@ -326,9 +330,11 @@ func (f *FileTreeCopier) getRemoteFile(localFile string) string {
 	return remoteFile
 }
 
-func (w *copyFileWorker) copyFile(localFile, remoteFile string) error {
-	commandAndArgs := FormatPowershellScriptCommandLine(`begin {
-	$path = '` + remoteFile + `'
+func (w *copyFileWorker) copyFile(localFile string) error {
+	defer w.f.waitGroup.Done()
+	remoteFile := w.f.getRemoteFile(localFile)
+	commandAndArgs := FormatPowerShellScriptCommandLine(`begin {
+	$path = ` + PowerShellSingleQuotedStringLiteral(remoteFile) + `
 	$DebugPreference = "Continue"
 	$ErrorActionPreference = "Stop"
 	Set-StrictMode -Version 2
@@ -347,9 +353,6 @@ end {
 	$fd.Close()
 	Write-Output "{""sha256"":""$hash""}"
 }`)
-	if log.IsLevelEnabled(log.TraceLevel) {
-		log.Tracef(strings.Join(commandAndArgs, " "))
-	}
 	stat, err := os.Lstat(localFile)
 	if err != nil {
 		return err
@@ -408,7 +411,7 @@ end {
 			}
 		}
 	}
-	fd.Close()
+	_ = fd.Close()
 	fdClosed = true
 	if err == io.EOF {
 		err = nil
@@ -443,16 +446,22 @@ end {
 	var stdout bytes.Buffer
 	gotError := int64(0)
 	go func() {
+		defer wg.Done()
 		_, err = io.Copy(&stderr, cmd.Stderr)
 		if err != nil {
-			log.Errorf("command(%s): error while buffering stderr: %v", cmd.id, err)
-			log.Errorf("command(%s): partial stderr: %#v", cmd.id, stderr.String())
+			log.WithFields(log.Fields{
+				logFieldLocalFile:      localFile,
+				logFieldCopyFileWorker: w.id,
+				log.ErrorKey:           err.Error(),
+				LogFieldCommandID:      cmd.ID(),
+				"stderr":               stderr.String(),
+			}).Errorf("error while buffering stderr")
 			stderr.Reset()
 			atomic.StoreInt64(&gotError, 1)
 		}
-		wg.Done()
 	}()
 	go func() {
+		defer wg.Done()
 		scanner := bufio.NewScanner(cmd.Stdout)
 		for scanner.Scan() {
 			var output struct {
@@ -466,33 +475,57 @@ end {
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			log.Errorf("command(%s): error while buffering stdout: %v", cmd.id, err)
-			log.Errorf("command(%s): partial stdout: %#v", cmd.id, stdout.String())
+			log.WithFields(log.Fields{
+				logFieldLocalFile:      localFile,
+				logFieldCopyFileWorker: w.id,
+				log.ErrorKey:           err.Error(),
+				LogFieldCommandID:      cmd.ID(),
+				"stdout":               stdout.String(),
+			}).Errorf("error while buffering stdout")
 			stdout.Reset()
 			atomic.StoreInt64(&gotError, 1)
 		}
-		wg.Done()
 	}()
 	cmd.Wait()
 	if cmd.ExitCode() != 0 {
-		log.Errorf("command(%s): command exited with non-zero code %d", cmd.id, cmd.ExitCode())
+		log.WithFields(log.Fields{
+			logFieldLocalFile:      localFile,
+			logFieldCopyFileWorker: w.id,
+			log.ErrorKey:           err.Error(),
+			LogFieldCommandID:      cmd.ID(),
+		}).Errorf("command exited with non-zero code %d", cmd.ExitCode())
 		atomic.StoreInt64(&gotError, 1)
 	}
 	wg.Wait()
 	w.shellUseTime += time.Since(commandStartTime)
 	if cmd.ExitCode() == 0 {
 		if sha256DigestRemote == "" {
-			log.Errorf("command(%s): copy file command did not output the expected JSON to stdout but exited with code 0", cmd.id)
+			log.WithFields(log.Fields{
+				logFieldLocalFile:      localFile,
+				logFieldCopyFileWorker: w.id,
+				LogFieldCommandID:      cmd.ID(),
+			}).Errorf("copy file command did not output the expected JSON to stdout but exited with code 0")
 			gotError = 1
 		} else if sha256DigestRemote != sha256DigestLocal {
-			log.Errorf("command(%s): copy file checksum mismatch (local = %s, remote = %s)", cmd.id, sha256DigestLocal, sha256DigestRemote)
+			log.WithFields(log.Fields{
+				logFieldLocalFile:      localFile,
+				logFieldCopyFileWorker: w.id,
+				LogFieldCommandID:      cmd.ID(),
+			}).Errorf("copy file checksum mismatch (local = %s, remote = %s)", sha256DigestLocal, sha256DigestRemote)
 			gotError = 1
 		}
 	}
 	if gotError == 0 {
 		return nil
 	}
-	return fmt.Errorf("command(%s): an error occured (see previous logs), stderr: %#v, stdout: %#v", cmd.id, stderr.String(), stdout.String())
+	log.WithFields(log.Fields{
+		logFieldLocalFile:      localFile,
+		logFieldCopyFileWorker: w.id,
+		LogFieldCommandID:      cmd.ID(),
+		"stdout":               stdout.String(),
+		"stderr":               stderr.String(),
+	}).Errorf("copy file command failed")
+	return fmt.Errorf("got errors while copying file (see logs)")
 }
 
 func formatMakeDirectoryCommand(remoteFile string, checkIfExists bool) string {

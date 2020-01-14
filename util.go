@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"unicode"
 	"unicode/utf16"
@@ -14,10 +15,50 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// FormatPowershellScriptCommandLine returns the command and arguments to run the specified PowerShell script.
+// PowerShellSingleQuotedStringLiteral returns a string that is a valid single quoted string literal in PowerShell, that evaluates to the
+// value of v.
+func PowerShellSingleQuotedStringLiteral(v string) string {
+	var sb strings.Builder
+	_, _ = sb.WriteRune('\'')
+	for _, rune := range v {
+		var esc string
+		switch rune {
+		case '\n':
+			esc = "`n"
+		case '\r':
+			esc = "`r"
+		case '\t':
+			esc = "`t"
+		case '\a':
+			esc = "`a"
+		case '\b':
+			esc = "`b"
+		case '\f':
+			esc = "`f"
+		case '\v':
+			esc = "`v"
+		case '"':
+			esc = "`\""
+		case '\'':
+			esc = "`'"
+		case '`':
+			esc = "``"
+		case '\x00':
+			esc = "`0"
+		default:
+			_, _ = sb.WriteRune(rune)
+			continue
+		}
+		_, _ = sb.WriteString(esc)
+	}
+	_, _ = sb.WriteRune('\'')
+	return sb.String()
+}
+
+// FormatPowerShellScriptCommandLine returns the command and arguments to run the specified PowerShell script.
 // The returned slice contains the following elements:
 // PowerShell -NoProfile -NonInteractive -ExecutionPolicy Unrestricted -EncodedCommand <base64>
-func FormatPowershellScriptCommandLine(script string) []string {
+func FormatPowerShellScriptCommandLine(script string) []string {
 	var scriptUTF16LE bytes.Buffer
 	for _, rune := range script {
 		r1, r2 := utf16.EncodeRune(rune)
@@ -71,11 +112,11 @@ func RunCommand(shell *Shell, command string, args []string, winrsConsoleModeStd
 		}
 	}
 	copyFunc := func(dst io.Writer, src io.Reader, name string) {
+		defer wg.Done()
 		_, err = io.Copy(dst, src)
 		if err != nil {
 			addError(fmt.Errorf("error while copying command's %s to own %s: %w", name, name, err))
 		}
-		wg.Done()
 	}
 	go copyFunc(os.Stderr, cmd.Stderr, "stderr")
 	go copyFunc(os.Stdout, cmd.Stdout, "stdout")
