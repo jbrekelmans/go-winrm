@@ -1,2 +1,3 @@
-spec:
-https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-wsmv/932240de-3943-4ed3-a162-8b3c4de5a286?redirectedfrom=MSDN
+# Introduction
+This package was created to enable Windows Remote Management clients written in Go to quickly transfer files.
+It's algorithm for copying files is hundreds of times quicker than https://github.com/packer-community/winrmcp.

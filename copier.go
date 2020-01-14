@@ -43,6 +43,7 @@ type stats struct {
 	lastReportTime        time.Time
 }
 
+// FileTreeCopier stores the state needed to efficiently copy file trees over the Windows Remote Management (WinRM) protocol.
 type FileTreeCopier struct {
 	errors        []error
 	errorsMutex   sync.Mutex
@@ -58,12 +59,12 @@ type FileTreeCopier struct {
 	done chan struct{}
 }
 
-// NewFileTreeCopier creates a new file copier. remoteRoot must be a cleaned absolute Windows file path that starts
-// with a drive letter.
+// NewFileTreeCopier creates a new file copier and guards against errorneous input. remoteRoot must be a cleaned absolute Windows file path
+// that starts with a drive letter.
 // Limitations:
 // 1. if localRoot is a regular file then the remote directory to which it would be copied must not contain an entry with a case-insensitive
 //    equal name.
-// 2. after cleaning localRoot (filepath.Clean), it should not contain any characters outside the regular expression class [a-zA-Z0-9-_\. ],
+// 2. after cleaning localRoot (using filepath.Clean), it should not contain any characters outside the regular expression class [a-zA-Z0-9-_\. ^&],
 //    because escaping such file names is not supported.
 func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTreeCopier, error) {
 	f := &FileTreeCopier{
@@ -71,8 +72,8 @@ func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTree
 		remoteRoot: remoteRoot,
 		shells:     make([]*Shell, len(shells)),
 	}
-	if len(shells) < 2 {
-		return nil, fmt.Errorf("there must be at least 2 shells")
+	if len(shells) < 1 {
+		return nil, fmt.Errorf("shells cannot be empty")
 	}
 	uniqueShells := map[*Shell]bool{}
 	for i, shell := range shells {
@@ -108,33 +109,31 @@ func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTree
 	return f, nil
 }
 
-type winrsWorker struct {
+// copyFileWorker is a structure created for each goroutine that copies files. It also stores state used to measure utilization of WinRM Shells.
+type copyFileWorker struct {
 	id           int
 	f            *FileTreeCopier
 	shell        *Shell
 	shellUseTime time.Duration
 }
 
-func newWinrsWorker(f *FileTreeCopier, id int, shell *Shell) *winrsWorker {
-	return &winrsWorker{
+func newCopyFileWorker(f *FileTreeCopier, id int, shell *Shell) *copyFileWorker {
+	return &copyFileWorker{
 		id:    id,
 		f:     f,
 		shell: shell,
 	}
 }
 
-func (w *winrsWorker) RunCommand(command string) error {
+func (w *copyFileWorker) RunCommand(command string) error {
 	log.Tracef(command)
-	if !log.IsLevelEnabled(shellUtilizationLogLevel) {
-		return RunCommand(w.shell, command, nil, true, false)
-	}
 	s := time.Now()
 	err := RunCommand(w.shell, command, nil, true, false)
 	w.shellUseTime += time.Since(s)
 	return err
 }
 
-func (w *winrsWorker) Run() {
+func (w *copyFileWorker) Run() {
 	startTime := time.Now()
 	for {
 		t, ok := <-w.f.copyFileTasks
@@ -153,7 +152,7 @@ func (w *winrsWorker) Run() {
 		elapsedTime := time.Since(startTime)
 		elapsedSeconds := elapsedTime.Seconds()
 		shellUsePercentage := w.shellUseTime.Seconds() / elapsedSeconds * 100.0
-		log.StandardLogger().Logf(shellUtilizationLogLevel, "winrsWorker(%d): goroutine finishing in %.2f seconds (shell utilization %.2f%%)", w.id, elapsedSeconds, shellUsePercentage)
+		log.StandardLogger().Logf(shellUtilizationLogLevel, "copyFileWorker(%d): goroutine finishing in %.2f seconds (shell utilization %.2f%%)", w.id, elapsedSeconds, shellUsePercentage)
 	}
 }
 
@@ -171,42 +170,19 @@ func validateFileBasename(fileBasename string) error {
 	return nil
 }
 
+// Run copies the file tree.
 func (f *FileTreeCopier) Run() error {
 	f.stats.startTime = time.Now()
 	f.stats.lastReportTime = f.stats.startTime
-	if f.localRootStat.Mode()&os.ModeType == 0 {
-		// root is a regular file, simple case
-		var shell *Shell
-		for _, s := range f.shells {
-			shell = s
-			break
-		}
-		w := newWinrsWorker(f, 0, shell)
-		remoteFile := f.getRemoteFile(f.localRoot)
-		i := strings.LastIndex(remoteFile, "\\")
-		// i must be greater than 0, by NewFileTreeCopier precondition
-		j := strings.LastIndex(remoteFile[:i], "\\")
-		if j >= 0 {
-			err := RunCommand(shell, formatMakeDirectoryCommand(remoteFile[:i], true), nil, true, false)
-			if err != nil {
-				return err
-			}
-		} else {
-			// optimization: do not attempt to make the directory if its the root.
-		}
-		return w.copyFile(f.localRoot, remoteFile)
-	} else if !f.localRootStat.IsDir() {
-		// ignore everything that is not a regular file or directory
-		return nil
-	}
 	for i := 1; i < len(f.shells); i++ {
-		winrsWorker := newWinrsWorker(f, i, f.shells[i])
-		go winrsWorker.Run()
+		copyFileWorker := newCopyFileWorker(f, i, f.shells[i])
+		go copyFileWorker.Run()
 	}
 	go f.reportLoop()
 	f.scanDirs()
 	f.waitGroup.Wait()
 	close(f.copyFileTasks)
+	// Signal to the goroutine running reportLoop that it can stop.
 	f.done <- struct{}{}
 	elapsedSeconds := time.Since(f.stats.startTime).Seconds()
 	overallBytesPerSecond := float64(f.stats.bytesCopied) / elapsedSeconds
@@ -248,6 +224,21 @@ func (f *FileTreeCopier) scanDirs() {
 					}
 				}
 			} else if de.IsRegular() {
+				if localFile == f.localRoot {
+					// Special case, if the root is a regular file, we need to ensure it's containing directory exists.
+					remoteFile := f.getRemoteFile(localFile)
+					i := strings.LastIndex(remoteFile, "\\")
+					// i >= because the root is a file
+					j := strings.LastIndex(remoteFile[:i], "\\")
+					if j >= 0 {
+						atomic.AddInt64(&f.stats.directoriesTotal, 1)
+						command := formatMakeDirectoryCommand(remoteFile[:i], true)
+						commandLength = copy(commandBuffer, command)
+						commandDirs++
+					} else {
+						// remoteFile[:i] is the root directory, so we do not need to check if it exists
+					}
+				}
 				stat, err := os.Lstat(localFile)
 				if err != nil {
 					return err
@@ -273,9 +264,9 @@ func (f *FileTreeCopier) scanDirs() {
 		commandLength = 0
 		commandDirs = 0
 	}
-	// We are done with the shell, use it for copying files.
-	winrsWorker := newWinrsWorker(f, 0, f.shells[0])
-	go winrsWorker.Run()
+	// We are done with f.shells[0], use it for copying files.
+	copyFileWorker := newCopyFileWorker(f, 0, f.shells[0])
+	go copyFileWorker.Run()
 	err = godirwalk.Walk(f.localRoot, &godirwalk.Options{
 		Callback: func(localFile string, de *godirwalk.Dirent) error {
 			if de.IsRegular() {
@@ -294,26 +285,12 @@ func (f *FileTreeCopier) scanDirs() {
 	}
 }
 
-func formatBytes(bytes float64) string {
-	units := []string{
-		"bytes",
-		"KiB",
-		"MiB",
-		"GiB",
-	}
-	power := 0
-	for bytes > 1024.0 && power < len(units) {
-		bytes /= 1024.0
-		power++
-	}
-	return fmt.Sprintf("%.3f %s", bytes, units[power])
-}
-
 func (f *FileTreeCopier) reportLoop() {
+outer:
 	for {
 		select {
 		case <-f.done:
-			break
+			break outer
 		case <-time.After(time.Second * 5):
 			now := time.Now()
 			bytesCopied := atomic.LoadInt64(&f.stats.bytesCopied)
@@ -349,7 +326,7 @@ func (f *FileTreeCopier) getRemoteFile(localFile string) string {
 	return remoteFile
 }
 
-func (w *winrsWorker) copyFile(localFile, remoteFile string) error {
+func (w *copyFileWorker) copyFile(localFile, remoteFile string) error {
 	commandAndArgs := FormatPowershellScriptCommandLine(`begin {
 	$path = '` + remoteFile + `'
 	$DebugPreference = "Continue"
@@ -377,7 +354,7 @@ end {
 	if err != nil {
 		return err
 	}
-	sha256DigestLocalComputer := sha256.New()
+	sha256DigestLocalObj := sha256.New()
 	sha256DigestLocal := ""
 	sha256DigestRemote := ""
 	fileSize := stat.Size()
@@ -393,7 +370,7 @@ end {
 			fdClosed = true
 		}
 	}()
-	s := time.Now()
+	commandStartTime := time.Now()
 	cmd, err := w.shell.StartCommand(commandAndArgs[0], commandAndArgs[1:], false, true)
 	if err != nil {
 		return err
@@ -418,10 +395,10 @@ end {
 		if bufferLength == bufferCapacity {
 			base64.StdEncoding.Encode(base64LineBuffer, buffer)
 			bytesCopied += int64(bufferLength)
-			_, _ = sha256DigestLocalComputer.Write(buffer)
+			_, _ = sha256DigestLocalObj.Write(buffer)
 			if bytesCopied >= fileSize {
 				ended = true
-				sha256DigestLocal = hex.EncodeToString(sha256DigestLocalComputer.Sum(nil))
+				sha256DigestLocal = hex.EncodeToString(sha256DigestLocalObj.Sum(nil))
 			}
 			err := cmd.SendInput(base64LineBuffer, ended)
 			atomic.AddInt64(&w.f.stats.bytesCopied, int64(bufferLength))
@@ -441,8 +418,8 @@ end {
 		return err
 	}
 	if !ended {
-		_, _ = sha256DigestLocalComputer.Write(buffer[:bufferLength])
-		sha256DigestLocal = hex.EncodeToString(sha256DigestLocalComputer.Sum(nil))
+		_, _ = sha256DigestLocalObj.Write(buffer[:bufferLength])
+		sha256DigestLocal = hex.EncodeToString(sha256DigestLocalObj.Sum(nil))
 		base64.StdEncoding.Encode(base64LineBuffer, buffer[:bufferLength])
 		i := base64.StdEncoding.EncodedLen(bufferLength)
 		base64LineBuffer[i] = '\r'
@@ -502,7 +479,7 @@ end {
 		atomic.StoreInt64(&gotError, 1)
 	}
 	wg.Wait()
-	w.shellUseTime += time.Since(s)
+	w.shellUseTime += time.Since(commandStartTime)
 	if cmd.ExitCode() == 0 {
 		if sha256DigestRemote == "" {
 			log.Errorf("command(%s): copy file command did not output the expected JSON to stdout but exited with code 0", cmd.id)
