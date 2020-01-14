@@ -13,7 +13,7 @@ import (
 
 func main() {
 	log.SetOutput(os.Stdout)
-	log.SetLevel(log.InfoLevel)
+	log.SetLevel(log.TraceLevel)
 
 	shellCount := 2
 	useTLS := true
@@ -57,14 +57,13 @@ func main() {
 			}
 		}
 	}()
-	scanDirWorkers := 2
 	localRoot := "scripts/cloud-builders-community/windows-builder"
 	remoteRoot := "C:\\workspace2"
 	// localRoot := "scripts/cloud-builders-community/windows-builder/scripts/bootstrap.ps1"
 	// remoteRoot := "C:\\workspace2\\bootstrap.ps1"
 	winrm.MustRunCommand(shells[0], `winrm get winrm/config`, nil, true, false)
 	winrm.MustRunCommand(shells[0], fmt.Sprintf(`if exist "%s" rd /s /q "%s"`, remoteRoot+"\\", remoteRoot), nil, true, false)
-	copier, err := winrm.NewFileTreeCopier(shells, scanDirWorkers, remoteRoot, localRoot)
+	copier, err := winrm.NewFileTreeCopier(shells, remoteRoot, localRoot)
 	err = copier.Run()
 	if err != nil {
 		log.Fatalf("error while copying file: %v", err)

@@ -2,6 +2,7 @@ package winrm
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -28,34 +29,15 @@ const shellUtilizationLogLevel = log.DebugLevel
 var regexpRemoteFileThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9]:(?:\\|(?:\\[a-zA-Z0-9-_\. ^&]+)+)$`)
 var regexpFileBasenameThatDoesNotNeedEscaping = regexp.MustCompile(`^[a-zA-Z0-9-_\. ^&]+$`)
 
-type winrsTaskType int
-
-const (
-	winrsTaskTypeMakeDirectories winrsTaskType = iota
-	winrsTaskTypeCopyFile
-)
-
-type winrsTaskStatus int
-
-const (
-	// pending means that the task is a dependant of another task, the task is in winrsTaskQueue or the task has been picked
-	// up by a worker goroutine (but is not yet in progress)
-	winrsTaskStatusPending winrsTaskStatus = iota
-	winrsTaskStatusInProgress
-	winrsTaskStatusCompleted
-)
-
-type winrsTask struct {
-	Type      winrsTaskType
-	LocalFile string
-}
-
-type scanDirTask struct {
+type copyFileTask struct {
 	LocalFile string
 }
 
 type stats struct {
 	bytesCopied           int64
+	bytesTotal            int64
+	directoriesCreated    int64
+	directoriesTotal      int64
 	startTime             time.Time
 	lastReportBytesCopied int64
 	lastReportTime        time.Time
@@ -67,15 +49,13 @@ type FileTreeCopier struct {
 	localRoot     string
 	localRootStat os.FileInfo
 	remoteRoot    string
-	// One shell for each winrs worker.
-	shells map[*Shell]bool
-	// The waitGroup counter is incremented for each winrsTask that is created, and once for each scanDirTask that is created.
-	waitGroup        sync.WaitGroup
-	winrsTaskQueue   chan *winrsTask
-	scanDirWorkers   int
-	scanDirTaskQueue chan *scanDirTask
-	stats            stats
-	done             chan struct{}
+	shells        []*Shell
+	// The waitGroup counter is incremented for each copyFileTask that is created.
+	waitGroup     sync.WaitGroup
+	copyFileTasks chan *copyFileTask
+	stats         stats
+	// Used to signal the report loop to finish
+	done chan struct{}
 }
 
 // NewFileTreeCopier creates a new file copier. remoteRoot must be a cleaned absolute Windows file path that starts
@@ -85,27 +65,25 @@ type FileTreeCopier struct {
 //    equal name.
 // 2. after cleaning localRoot (filepath.Clean), it should not contain any characters outside the regular expression class [a-zA-Z0-9-_\. ],
 //    because escaping such file names is not supported.
-func NewFileTreeCopier(shells []*Shell, scanDirWorkers int, remoteRoot, localRoot string) (*FileTreeCopier, error) {
+func NewFileTreeCopier(shells []*Shell, remoteRoot, localRoot string) (*FileTreeCopier, error) {
 	f := &FileTreeCopier{
-		localRoot:      localRoot,
-		remoteRoot:     remoteRoot,
-		scanDirWorkers: scanDirWorkers,
-		shells:         map[*Shell]bool{},
+		localRoot:  localRoot,
+		remoteRoot: remoteRoot,
+		shells:     make([]*Shell, len(shells)),
 	}
-	if f.scanDirWorkers < 1 {
-		return nil, fmt.Errorf("scanDirWorkers must be at least 1")
+	if len(shells) < 2 {
+		return nil, fmt.Errorf("there must be at least 2 shells")
 	}
-	if len(shells) == 0 {
-		return nil, fmt.Errorf("shells cannot be empty")
-	}
-	for _, shell := range shells {
+	uniqueShells := map[*Shell]bool{}
+	for i, shell := range shells {
 		if shell == nil {
 			return nil, fmt.Errorf("shells contains a nil shell")
 		}
-		if _, ok := f.shells[shell]; ok {
+		if _, ok := uniqueShells[shell]; ok {
 			return nil, fmt.Errorf("shells contains duplicate shell objects")
 		}
-		f.shells[shell] = true
+		uniqueShells[shell] = true
+		f.shells[i] = shell
 	}
 	if filepath.IsAbs(f.localRoot) {
 		return nil, fmt.Errorf("localRoot must be a relative file")
@@ -125,8 +103,7 @@ func NewFileTreeCopier(shells []*Shell, scanDirWorkers int, remoteRoot, localRoo
 	if err != nil {
 		return nil, err
 	}
-	f.winrsTaskQueue = make(chan *winrsTask, len(f.shells)*2)
-	f.scanDirTaskQueue = make(chan *scanDirTask, 10000)
+	f.copyFileTasks = make(chan *copyFileTask, len(f.shells)*2)
 	f.done = make(chan struct{})
 	return f, nil
 }
@@ -160,38 +137,17 @@ func (w *winrsWorker) RunCommand(command string) error {
 func (w *winrsWorker) Run() {
 	startTime := time.Now()
 	for {
-		log.Debugf("winrsWorker(%d): pulling task from queue", w.id)
-		t, ok := <-w.f.winrsTaskQueue
+		t, ok := <-w.f.copyFileTasks
 		if !ok {
 			break
 		}
-		switch t.Type {
-		case winrsTaskTypeMakeDirectories:
-			remoteFile := w.f.getRemoteFile(t.LocalFile)
-			err := w.makeDirectories(remoteFile, remoteFile == w.f.remoteRoot)
-			if err != nil {
-				log.Errorf("mkdir %#v failed: %v", remoteFile, err)
-				w.f.addError(err)
-			} else {
-				log.Infof("mkdir %#v succeeded", remoteFile)
-			}
-			w.f.scanDirTaskQueue <- &scanDirTask{
-				LocalFile: t.LocalFile,
-			}
-			log.Debugf("queued scandir %#v", t.LocalFile)
-		case winrsTaskTypeCopyFile:
-			remoteFile := w.f.getRemoteFile(t.LocalFile)
-			err := w.copyFile(t.LocalFile, remoteFile)
-			if err != nil {
-				log.Errorf("cp %#v failed: %v", remoteFile, err)
-				w.f.addError(err)
-			} else {
-				log.Infof("cp %#v succeeded", remoteFile)
-			}
-			w.f.waitGroup.Done()
-		default:
-			panic(fmt.Errorf("winrsTask has unknown type %d", t.Type))
+		remoteFile := w.f.getRemoteFile(t.LocalFile)
+		err := w.copyFile(t.LocalFile, remoteFile)
+		if err != nil {
+			log.Errorf("cp %#v failed: %v", t.LocalFile, err)
+			w.f.addError(err)
 		}
+		w.f.waitGroup.Done()
 	}
 	if log.IsLevelEnabled(shellUtilizationLogLevel) {
 		elapsedTime := time.Since(startTime)
@@ -215,79 +171,13 @@ func validateFileBasename(fileBasename string) error {
 	return nil
 }
 
-func (f *FileTreeCopier) scanDirWorker(id int) {
-	for {
-		log.Debugf("scanDirWorker(%d): pulling task from queue", id)
-		t, ok := <-f.scanDirTaskQueue
-		if !ok {
-			break
-		}
-		scanner, err := godirwalk.NewScanner(t.LocalFile)
-		if err != nil {
-			f.addError(err)
-		} else {
-			for scanner.Scan() {
-				err := validateFileBasename(scanner.Name())
-				if err != nil {
-					f.addError(err)
-					break
-				}
-				childLocalFileInfo, err := scanner.Dirent()
-				if err != nil {
-					f.addError(err)
-					break
-				}
-				childLocalFile := filepath.Join(t.LocalFile, scanner.Name())
-				switch {
-				case err != nil:
-					f.addError(err)
-					break
-				case childLocalFileInfo.IsDir():
-					f.scanDirWorkerDir(t.LocalFile, childLocalFile)
-				case childLocalFileInfo.IsRegular():
-					f.scanDirWorkerRegularFile(t.LocalFile, childLocalFile)
-				}
-			}
-			if err := scanner.Err(); err != nil {
-				f.addError(err)
-			}
-		}
-		f.waitGroup.Done()
-	}
-	log.Debugf("scanDirWorker(%d): goroutine finishing", id)
-}
-
-func (f *FileTreeCopier) scanDirWorkerDir(localFileParent, localFile string) {
-	t := &winrsTask{
-		Type:      winrsTaskTypeMakeDirectories,
-		LocalFile: localFile,
-	}
-	f.waitGroup.Add(1)
-	f.winrsTaskQueue <- t
-	if log.IsLevelEnabled(log.DebugLevel) {
-		log.Debugf("queued mkdir %#v", f.getRemoteFile(localFile))
-	}
-}
-
-func (f *FileTreeCopier) scanDirWorkerRegularFile(localFileParent, localFile string) {
-	t := &winrsTask{
-		Type:      winrsTaskTypeCopyFile,
-		LocalFile: localFile,
-	}
-	f.waitGroup.Add(1)
-	f.winrsTaskQueue <- t
-	if log.IsLevelEnabled(log.DebugLevel) {
-		log.Debugf("queued cp %#v", f.getRemoteFile(localFile))
-	}
-}
-
 func (f *FileTreeCopier) Run() error {
 	f.stats.startTime = time.Now()
 	f.stats.lastReportTime = f.stats.startTime
 	if f.localRootStat.Mode()&os.ModeType == 0 {
 		// root is a regular file, simple case
 		var shell *Shell
-		for s := range f.shells {
+		for _, s := range f.shells {
 			shell = s
 			break
 		}
@@ -297,7 +187,7 @@ func (f *FileTreeCopier) Run() error {
 		// i must be greater than 0, by NewFileTreeCopier precondition
 		j := strings.LastIndex(remoteFile[:i], "\\")
 		if j >= 0 {
-			err := w.makeDirectories(remoteFile[:i], true)
+			err := RunCommand(shell, formatMakeDirectoryCommand(remoteFile[:i], true), nil, true, false)
 			if err != nil {
 				return err
 			}
@@ -309,40 +199,96 @@ func (f *FileTreeCopier) Run() error {
 		// ignore everything that is not a regular file or directory
 		return nil
 	}
-	// root is a directory
-	remoteFile := f.getRemoteFile(f.localRoot)
-	if strings.HasSuffix(remoteFile, "\\") {
-		// the constructor precondition ensures that this is the correct check for detecting if
-		// remoteFile is the root (e.g. C:\)
-		// optimization: do not attempt to make the directory if its the root.
-		f.waitGroup.Add(1)
-		f.scanDirTaskQueue <- &scanDirTask{
-			LocalFile: f.localRoot,
-		}
-	} else {
-		f.createMkdirTaskForRootOfFileTreeToCopy(f.localRoot)
-	}
-	i := 0
-	for shell := range f.shells {
-		winrsWorker := newWinrsWorker(f, i, shell)
+	for i := 1; i < len(f.shells); i++ {
+		winrsWorker := newWinrsWorker(f, i, f.shells[i])
 		go winrsWorker.Run()
-		i++
-	}
-	for i := 0; i < f.scanDirWorkers; i++ {
-		go f.scanDirWorker(i)
 	}
 	go f.reportLoop()
+	f.scanDirs()
 	f.waitGroup.Wait()
-	close(f.winrsTaskQueue)
-	close(f.scanDirTaskQueue)
+	close(f.copyFileTasks)
 	f.done <- struct{}{}
 	elapsedSeconds := time.Since(f.stats.startTime).Seconds()
 	overallBytesPerSecond := float64(f.stats.bytesCopied) / elapsedSeconds
-	log.Infof("copied file tree with %d errors in %2f seconds (upload speed = %s/s)", len(f.errors), elapsedSeconds, formatBytes(overallBytesPerSecond))
+	log.Infof("copied file tree with %d errors in %2f seconds (upload speed = %s/s, total size = %s)", len(f.errors), elapsedSeconds, formatBytes(overallBytesPerSecond), formatBytes(float64(f.stats.bytesTotal)))
 	if len(f.errors) == 0 {
 		return nil
 	}
 	return f.errors[0]
+}
+
+func (f *FileTreeCopier) scanDirs() {
+	maxCommandSize := f.shells[0].MaxSizeOfCommandWithZeroArguments()
+	commandBuffer := make([]byte, maxCommandSize)
+	commandDirs := int64(0)
+	commandLength := 0
+	err := godirwalk.Walk(f.localRoot, &godirwalk.Options{
+		Callback: func(localFile string, de *godirwalk.Dirent) error {
+			if de.IsDir() {
+				remoteFile := f.getRemoteFile(localFile)
+				if !strings.HasSuffix(remoteFile, "\\") {
+					// Do not attempt to create the root directory...
+					command := formatMakeDirectoryCommand(remoteFile, localFile == f.localRoot)
+					atomic.AddInt64(&f.stats.directoriesTotal, 1)
+					if len(command)+3+commandLength <= maxCommandSize {
+						commandLength += copy(commandBuffer[commandLength:], " & ")
+						commandLength += copy(commandBuffer[commandLength:], command)
+						commandDirs++
+					} else {
+						err := RunCommand(f.shells[0], string(commandBuffer[:commandLength]), nil, true, false)
+						if err != nil {
+							return err
+						}
+						atomic.AddInt64(&f.stats.directoriesCreated, commandDirs)
+						commandLength = copy(commandBuffer, command)
+						commandDirs = 1
+					}
+				}
+			} else if de.IsRegular() {
+				stat, err := os.Lstat(localFile)
+				if err != nil {
+					return err
+				}
+				atomic.AddInt64(&f.stats.bytesTotal, stat.Size())
+			}
+			return nil
+		},
+		FollowSymbolicLinks: false,
+		Unsorted:            true,
+	})
+	if err != nil {
+		f.addError(err)
+		return
+	}
+	if commandLength > 0 {
+		err := RunCommand(f.shells[0], string(commandBuffer[:commandLength]), nil, true, false)
+		if err != nil {
+			f.addError(err)
+			return
+		}
+		atomic.AddInt64(&f.stats.directoriesCreated, commandDirs)
+		commandLength = 0
+		commandDirs = 0
+	}
+	// We are done with the shell, use it for copying files.
+	winrsWorker := newWinrsWorker(f, 0, f.shells[0])
+	go winrsWorker.Run()
+	err = godirwalk.Walk(f.localRoot, &godirwalk.Options{
+		Callback: func(localFile string, de *godirwalk.Dirent) error {
+			if de.IsRegular() {
+				f.waitGroup.Add(1)
+				f.copyFileTasks <- &copyFileTask{
+					LocalFile: localFile,
+				}
+			}
+			return nil
+		},
+		FollowSymbolicLinks: false,
+		Unsorted:            true,
+	})
+	if err != nil {
+		f.addError(err)
+	}
 }
 
 func formatBytes(bytes float64) string {
@@ -367,13 +313,19 @@ func (f *FileTreeCopier) reportLoop() {
 			break
 		case <-time.After(time.Second * 5):
 			now := time.Now()
-			v := atomic.LoadInt64(&f.stats.bytesCopied)
-			bytesCopied := v - f.stats.lastReportBytesCopied
+			bytesCopied := atomic.LoadInt64(&f.stats.bytesCopied)
+			bytesCopiedChange := bytesCopied - f.stats.lastReportBytesCopied
 			elapsedTime := now.Sub(f.stats.lastReportTime)
-			f.stats.lastReportBytesCopied = v
+			f.stats.lastReportBytesCopied = bytesCopied
 			f.stats.lastReportTime = now
-			bytesCopiedPerSecond := float64(bytesCopied) / elapsedTime.Seconds()
-			log.Infof("stats: upload speed = %s/s", formatBytes(bytesCopiedPerSecond))
+			bytesCopiedPerSecond := float64(bytesCopiedChange) / elapsedTime.Seconds()
+			progress := float64(bytesCopied) / float64(atomic.LoadInt64(&f.stats.bytesTotal))
+			log.Infof("stats: upload speed = %s/s, progress = %.1f%%, dirs = %d/%d",
+				formatBytes(bytesCopiedPerSecond),
+				progress,
+				atomic.LoadInt64(&f.stats.directoriesCreated),
+				atomic.LoadInt64(&f.stats.directoriesTotal),
+			)
 		}
 	}
 	log.Debugf("reportLoop: goroutine finishing")
@@ -392,18 +344,6 @@ func (f *FileTreeCopier) getRemoteFile(localFile string) string {
 		}
 	}
 	return remoteFile
-}
-
-func (f *FileTreeCopier) createMkdirTaskForRootOfFileTreeToCopy(localFile string) {
-	t := &winrsTask{
-		Type:      winrsTaskTypeMakeDirectories,
-		LocalFile: localFile,
-	}
-	f.waitGroup.Add(1)
-	f.winrsTaskQueue <- t
-	if log.IsLevelEnabled(log.DebugLevel) {
-		log.Debugf("queued mkdir %#v", f.getRemoteFile(localFile))
-	}
 }
 
 func (w *winrsWorker) copyFile(localFile, remoteFile string) error {
@@ -494,6 +434,7 @@ end {
 		err = nil
 	}
 	if err != nil {
+		cmd.Signal()
 		return err
 	}
 	if !ended {
@@ -518,60 +459,63 @@ end {
 	}
 	var wg sync.WaitGroup
 	wg.Add(2)
-	var errors []error
-	var errorsMutex sync.Mutex
+	var stderr bytes.Buffer
+	var stdout bytes.Buffer
+	gotError := int64(0)
 	go func() {
-		_, err = io.Copy(os.Stderr, cmd.Stderr)
+		_, err = io.Copy(&stderr, cmd.Stderr)
 		if err != nil {
-			errWrapped := fmt.Errorf("error while copying command's stderr to own stderr: %w", err)
-			errorsMutex.Lock()
-			errors = append(errors, errWrapped)
-			errorsMutex.Unlock()
+			log.Errorf("command(%s): error while buffering stderr: %v", cmd.id, err)
+			log.Errorf("command(%s): partial stderr: %#v", cmd.id, stderr.String())
+			stderr.Reset()
+			atomic.StoreInt64(&gotError, 1)
 		}
 		wg.Done()
 	}()
 	go func() {
 		scanner := bufio.NewScanner(cmd.Stdout)
 		for scanner.Scan() {
-			os.Stdout.Write(append(scanner.Bytes(), '\n'))
 			var output struct {
 				Sha256 string `json:"sha256"`
 			}
 			if json.Unmarshal(scanner.Bytes(), &output) == nil {
 				sha256DigestRemote = output.Sha256
+			} else {
+				_, _ = stdout.Write(scanner.Bytes())
+				_, _ = stdout.WriteString("\n")
 			}
 		}
-		if scanner.Err() != nil {
-			errWrapped := fmt.Errorf("error while copying command's stdout to own stdout: %w", err)
-			errorsMutex.Lock()
-			errors = append(errors, errWrapped)
-			errorsMutex.Unlock()
+		if err := scanner.Err(); err != nil {
+			log.Errorf("command(%s): error while buffering stdout: %v", cmd.id, err)
+			log.Errorf("command(%s): partial stdout: %#v", cmd.id, stdout.String())
+			stdout.Reset()
+			atomic.StoreInt64(&gotError, 1)
 		}
 		wg.Done()
 	}()
 	cmd.Wait()
 	if cmd.ExitCode() != 0 {
-		err := fmt.Errorf("command unexpectedly exited with code %d", cmd.ExitCode())
-		errorsMutex.Lock()
-		errors = append(errors, err)
-		errorsMutex.Unlock()
+		log.Errorf("command(%s): command exited with non-zero code %d", cmd.id, cmd.ExitCode())
+		atomic.StoreInt64(&gotError, 1)
 	}
 	wg.Wait()
 	w.shellUseTime += time.Since(s)
-	if sha256DigestRemote != sha256DigestLocal {
-		errors = append(errors, fmt.Errorf("local and remote checksum of file %#v, %s and %s, respectively, do not match", remoteFile, sha256DigestLocal, sha256DigestRemote))
-	}
-	err = nil
-	if len(errors) != 0 {
-		err = errors[0]
-		for i := 1; i < len(errors); i++ {
-			log.Error(errors[i])
+	if cmd.ExitCode() == 0 {
+		if sha256DigestRemote == "" {
+			log.Errorf("command(%s): copy file command did not output the expected JSON to stdout but exited with code 0", cmd.id)
+			gotError = 1
+		} else if sha256DigestRemote != sha256DigestLocal {
+			log.Errorf("command(%s): copy file checksum mismatch (local = %s, remote = %s)", cmd.id, sha256DigestLocal, sha256DigestRemote)
+			gotError = 1
 		}
 	}
-	return err
+	if gotError == 0 {
+		return nil
+	}
+	return fmt.Errorf("command(%s): an error occured (see previous logs), stderr: %#v, stdout: %#v", cmd.id, stderr.String(), stdout.String())
 }
 
-func (w *winrsWorker) makeDirectories(remoteFile string, checkIfExists bool) error {
+func formatMakeDirectoryCommand(remoteFile string, checkIfExists bool) string {
 	var command string
 	if checkIfExists {
 		remoteFileWithSlash := remoteFile + "\\"
@@ -579,5 +523,5 @@ func (w *winrsWorker) makeDirectories(remoteFile string, checkIfExists bool) err
 	} else {
 		command = fmt.Sprintf(`md "%s"`, remoteFile)
 	}
-	return w.RunCommand(command)
+	return command
 }

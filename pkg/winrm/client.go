@@ -16,10 +16,10 @@ import (
 	"unsafe"
 
 	"github.com/gofrs/uuid"
-	soap "github.com/jbrekelmans/go-winrm-fast/pkg/winrm/soap"
 	zenwinrm "github.com/masterzen/winrm"
 	zensoap "github.com/masterzen/winrm/soap"
 	log "github.com/sirupsen/logrus"
+	soap "github.service.anz/anzx/cloud-builders/windows/builder/pkg/winrm/soap"
 )
 
 const MaxCommandLineSize = 8191
@@ -205,12 +205,18 @@ func (c *Client) CreateShell() (*Shell, error) {
 		return nil, err
 	}
 	id := getID(zenShell)
+	requestBody := soap.StartCommandRequest(c.URL(), c.zenParams.EnvelopeSize, c.defaultOperationTimeoutSeconds, uuid.UUID{}, id, false, false, "", nil)
 	log.Debugf("created remote winrm shell %#v", id)
 	return &Shell{
-		c:        c,
-		id:       id,
-		zenShell: zenShell,
+		c:                                 c,
+		id:                                id,
+		maxSizeOfCommandWithZeroArguments: MaxCommandLineSize - len(requestBody),
+		zenShell:                          zenShell,
 	}, nil
+}
+
+func (s *Shell) MaxSizeOfCommandWithZeroArguments() int {
+	return s.maxSizeOfCommandWithZeroArguments
 }
 
 // SendInputMax returns the maximum value number of bytes (with this client's settings) that can be sent in one

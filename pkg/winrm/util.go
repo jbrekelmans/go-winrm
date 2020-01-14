@@ -47,6 +47,7 @@ func RunCommand(shell *Shell, command string, args []string, winrsConsoleModeStd
 	if err != nil {
 		return err
 	}
+	defer cmd.Signal()
 	var wg sync.WaitGroup
 	wg.Add(2)
 	var errors []error
