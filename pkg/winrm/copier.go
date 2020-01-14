@@ -230,8 +230,11 @@ func (f *FileTreeCopier) scanDirs() {
 					// Do not attempt to create the root directory...
 					command := formatMakeDirectoryCommand(remoteFile, localFile == f.localRoot)
 					atomic.AddInt64(&f.stats.directoriesTotal, 1)
-					if len(command)+3+commandLength <= maxCommandSize {
-						commandLength += copy(commandBuffer[commandLength:], " & ")
+					if commandLength == 0 {
+						commandLength = copy(commandBuffer, command)
+						commandDirs++
+					} else if len(command)+1+commandLength <= maxCommandSize {
+						commandLength += copy(commandBuffer[commandLength:], "&")
 						commandLength += copy(commandBuffer[commandLength:], command)
 						commandDirs++
 					} else {

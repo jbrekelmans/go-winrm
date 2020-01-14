@@ -16,10 +16,10 @@ import (
 	"unsafe"
 
 	"github.com/gofrs/uuid"
+	soap "github.com/jbrekelmans/go-winrm-fast/pkg/winrm/soap"
 	zenwinrm "github.com/masterzen/winrm"
 	zensoap "github.com/masterzen/winrm/soap"
 	log "github.com/sirupsen/logrus"
-	soap "github.service.anz/anzx/cloud-builders/windows/builder/pkg/winrm/soap"
 )
 
 const MaxCommandLineSize = 8191
