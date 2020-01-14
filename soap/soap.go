@@ -1,17 +1,20 @@
 package soap
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/xml"
+	"io"
 	"strconv"
 	"strings"
 
 	"github.com/gofrs/uuid"
 )
 
+// Locale is a constant for the locale that is hardcoded in SOAP headers created by this package.
 const Locale = "en-US"
-const cdataStart = "<![CDATA["
-const cdataEnd = "]]>"
+
+// MimeType is the mime type of SOAP content.
 const MimeType = "application/soap+xml"
 
 func prefix(sb *strings.Builder, to string, maxEnvelopeSize int, operationTimeoutSec int, messageID uuid.UUID, action, shellID string) {
@@ -75,20 +78,13 @@ func StartCommandRequest(
 	sb.WriteString(`</s:Header>` +
 		`<s:Body>` +
 		`<r:CommandLine>` +
-		`<r:Command>` +
-		cdataStart)
-	if strings.Contains(command, cdataEnd) {
-		panic("args contains an invalid arg")
-	}
-	sb.WriteString(command)
-	sb.WriteString(cdataEnd + `</r:Command>`)
+		`<r:Command>`)
+	_ = emitCData(&sb, []byte(command))
+	sb.WriteString(`</r:Command>`)
 	for _, arg := range args {
-		if strings.Contains(arg, cdataEnd) {
-			panic("args contains an invalid arg")
-		}
-		sb.WriteString(`<r:Arguments>` + cdataStart)
-		sb.WriteString(arg)
-		sb.WriteString(cdataEnd + `</r:Arguments>`)
+		sb.WriteString(`<r:Arguments>`)
+		_ = emitCData(&sb, []byte(arg))
+		sb.WriteString(`</r:Arguments>`)
 	}
 	sb.WriteString(`</r:CommandLine>` +
 		`</s:Body>` +
@@ -127,4 +123,36 @@ func SendInputRequest(
 		`</s:Body>` +
 		`</s:Envelope>`)
 	return sb.String()
+}
+
+var cdataStart = []byte("<![CDATA[")
+var cdataEscape = []byte("]]]]><![CDATA[>")
+var cdataEnd = []byte("]]>")
+
+func emitCData(w io.Writer, b []byte) error {
+	_, err := w.Write(cdataStart)
+	if err != nil {
+		return err
+	}
+	for {
+		i := bytes.Index(b, cdataEnd)
+		if i < 0 {
+			_, err = w.Write(b)
+			if err != nil {
+				return err
+			}
+			break
+		}
+		_, err = w.Write(b[:i])
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(cdataEscape)
+		if err != nil {
+			return err
+		}
+		b = b[i+len(cdataEnd):]
+	}
+	_, err = w.Write(cdataEnd)
+	return err
 }
