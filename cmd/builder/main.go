@@ -15,7 +15,7 @@ func main() {
 	log.SetOutput(os.Stdout)
 	log.SetLevel(log.InfoLevel)
 
-	shellCount := 2
+	shellCount := 5
 	useTLS := true
 	maxEnvelopeSize := 500 * 1000
 	host := ""
@@ -57,18 +57,15 @@ func main() {
 			}
 		}
 	}()
-	scanDirWorkers := 2
 	localRoot := "scripts/cloud-builders-community/windows-builder"
 	remoteRoot := "C:\\workspace2"
-	// localRoot := "scripts/cloud-builders-community/windows-builder/scripts/bootstrap.ps1"
-	// remoteRoot := "C:\\workspace2\\bootstrap.ps1"
-	winrm.MustRunCommand(shells[0], `winrm get winrm/config`, nil, true, false)
+	// winrm.MustRunCommand(shells[0], `winrm get winrm/config`, nil, true, false)
 	winrm.MustRunCommand(shells[0], fmt.Sprintf(`if exist "%s" rd /s /q "%s"`, remoteRoot+"\\", remoteRoot), nil, true, false)
-	copier, err := winrm.NewFileTreeCopier(shells, scanDirWorkers, remoteRoot, localRoot)
+	copier, err := winrm.NewFileTreeCopier(shells, remoteRoot, localRoot)
 	err = copier.Run()
 	if err != nil {
 		log.Fatalf("error while copying file: %v", err)
 	}
-	winrm.MustRunCommand(shells[0], fmt.Sprintf(`dir "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder"), nil, true, false)
-	winrm.MustRunCommand(shells[0], fmt.Sprintf(`type "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder\\README.md"), nil, true, false)
+	// winrm.MustRunCommand(shells[0], fmt.Sprintf(`dir "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder"), nil, true, false)
+	// winrm.MustRunCommand(shells[0], fmt.Sprintf(`type "%s"`, "C:\\workspace2\\scripts\\cloud-builders-community\\windows-builder\\README.md"), nil, true, false)
 }
