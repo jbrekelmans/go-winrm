@@ -13,9 +13,9 @@ import (
 
 func main() {
 	log.SetOutput(os.Stdout)
-	log.SetLevel(log.DebugLevel)
+	log.SetLevel(log.InfoLevel)
 
-	shellCount := 2
+	shellCount := 5
 	useTLS := true
 	maxEnvelopeSize := 500 * 1000
 	host := "35.201.4.189"

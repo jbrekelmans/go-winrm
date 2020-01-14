@@ -322,7 +322,7 @@ func (f *FileTreeCopier) reportLoop() {
 			f.stats.lastReportBytesCopied = bytesCopied
 			f.stats.lastReportTime = now
 			bytesCopiedPerSecond := float64(bytesCopiedChange) / elapsedTime.Seconds()
-			progress := float64(bytesCopied) / float64(atomic.LoadInt64(&f.stats.bytesTotal))
+			progress := float64(bytesCopied) / float64(atomic.LoadInt64(&f.stats.bytesTotal)) * 100.0
 			log.Infof("stats: upload speed = %s/s, progress = %.1f%%, dirs = %d/%d",
 				formatBytes(bytesCopiedPerSecond),
 				progress,
