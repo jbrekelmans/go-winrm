@@ -200,8 +200,7 @@ func (f *FileTreeCopier) Run() error {
 }
 
 func (f *FileTreeCopier) scanDirs() {
-	maxCommandSize := f.shells[0].MaxSizeOfCommandWithZeroArguments()
-	commandBuffer := make([]byte, maxCommandSize)
+	commandBuffer := make([]byte, MaxCommandLineSize)
 	commandDirs := int64(0)
 	commandLength := 0
 	err := godirwalk.Walk(f.localRoot, &godirwalk.Options{
@@ -215,7 +214,7 @@ func (f *FileTreeCopier) scanDirs() {
 					if commandLength == 0 {
 						commandLength = copy(commandBuffer, command)
 						commandDirs++
-					} else if len(command)+1+commandLength <= maxCommandSize {
+					} else if len(command)+1+commandLength <= MaxCommandLineSize {
 						commandLength += copy(commandBuffer[commandLength:], "&")
 						commandLength += copy(commandBuffer[commandLength:], command)
 						commandDirs++
