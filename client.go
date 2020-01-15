@@ -22,8 +22,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// MaxCommandLineSize is not really useful. TODO https://github.com/jbrekelmans/go-winrm/issues/7 make this more useful.
-const MaxCommandLineSize = 8191
+// MaxCommandLineSize is the maximum size of a command with zero additional arguments, in bytes.
+// The value is 8157, even though Microsoft documents a maximum command line size of 8191.
+// The difference is the result of emperical testing (i.e. (*Client).StartCommand failing commands larger than 8157).
+const MaxCommandLineSize = 8157
 const zeroUUID = "00000000-0000-0000-0000-000000000000"
 
 // LogFieldShellID is the name of the field containing the WinRM Shell identifier.
@@ -220,17 +222,13 @@ func (c *Client) CreateShell() (*Shell, error) {
 		return nil, err
 	}
 	id := getID(zenShell)
-	requestBody := soap.StartCommandRequest(c.URL(), c.zenParams.EnvelopeSize, c.defaultOperationTimeoutSeconds, uuid.UUID{}, id, false, false, "", nil)
-	// TODO https://github.com/jbrekelmans/go-winrm/issues/7 this seems to be incorrectly calculated
-	maxSizeOfCommandWithZeroArguments := MaxCommandLineSize - len(requestBody)
 	log.WithFields(log.Fields{
 		LogFieldShellID: id,
 	}).Debugf("created remote winrm shell")
 	return &Shell{
-		c:                                 c,
-		id:                                id,
-		maxSizeOfCommandWithZeroArguments: maxSizeOfCommandWithZeroArguments,
-		zenShell:                          zenShell,
+		c:        c,
+		id:       id,
+		zenShell: zenShell,
 	}, nil
 }
 
@@ -262,16 +260,9 @@ func (c *Client) ZenParametersConst() *zenwinrm.Parameters {
 
 // Shell represents a WinRM remote shell. See (*Client).CreateShell.
 type Shell struct {
-	c                                 *Client
-	maxSizeOfCommandWithZeroArguments int
-	zenShell                          *zenwinrm.Shell
-	id                                string
-}
-
-// MaxSizeOfCommandWithZeroArguments returns the length of the longest command that can be passed to c.StartCommand, assuming zero
-// arguments.
-func (s *Shell) MaxSizeOfCommandWithZeroArguments() int {
-	return s.maxSizeOfCommandWithZeroArguments
+	c        *Client
+	zenShell *zenwinrm.Shell
+	id       string
 }
 
 // Client returns the *Client associated with this shell. All commands created from this Shell perform HTTP requests

@@ -200,8 +200,7 @@ func (f *FileTreeCopier) Run() error {
 }
 
 func (f *FileTreeCopier) scanDirs() {
-	maxCommandSize := f.shells[0].MaxSizeOfCommandWithZeroArguments()
-	commandBuffer := make([]byte, maxCommandSize)
+	commandBuffer := make([]byte, MaxCommandLineSize)
 	commandDirs := int64(0)
 	commandLength := 0
 	err := godirwalk.Walk(f.localRoot, &godirwalk.Options{
@@ -215,7 +214,7 @@ func (f *FileTreeCopier) scanDirs() {
 					if commandLength == 0 {
 						commandLength = copy(commandBuffer, command)
 						commandDirs++
-					} else if len(command)+1+commandLength <= maxCommandSize {
+					} else if len(command)+1+commandLength <= MaxCommandLineSize {
 						commandLength += copy(commandBuffer[commandLength:], "&")
 						commandLength += copy(commandBuffer[commandLength:], command)
 						commandDirs++
@@ -239,6 +238,9 @@ func (f *FileTreeCopier) scanDirs() {
 					if j >= 0 {
 						atomic.AddInt64(&f.stats.directoriesTotal, 1)
 						command := formatMakeDirectoryCommand(remoteFile[:i], true)
+						log.Info(localFile)
+						log.Info(remoteFile)
+						log.Info(command)
 						commandLength = copy(commandBuffer, command)
 						commandDirs++
 					} else {
@@ -253,6 +255,7 @@ func (f *FileTreeCopier) scanDirs() {
 			}
 			return nil
 		},
+		AllowNonDirectory:   true,
 		FollowSymbolicLinks: false,
 		Unsorted:            true,
 	})
@@ -283,6 +286,7 @@ func (f *FileTreeCopier) scanDirs() {
 			}
 			return nil
 		},
+		AllowNonDirectory:   true,
 		FollowSymbolicLinks: false,
 		Unsorted:            true,
 	})
