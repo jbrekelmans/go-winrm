@@ -239,6 +239,9 @@ func (f *FileTreeCopier) scanDirs() {
 					if j >= 0 {
 						atomic.AddInt64(&f.stats.directoriesTotal, 1)
 						command := formatMakeDirectoryCommand(remoteFile[:i], true)
+						log.Info(localFile)
+						log.Info(remoteFile)
+						log.Info(command)
 						commandLength = copy(commandBuffer, command)
 						commandDirs++
 					} else {
@@ -253,6 +256,7 @@ func (f *FileTreeCopier) scanDirs() {
 			}
 			return nil
 		},
+		AllowNonDirectory:   true,
 		FollowSymbolicLinks: false,
 		Unsorted:            true,
 	})
@@ -283,6 +287,7 @@ func (f *FileTreeCopier) scanDirs() {
 			}
 			return nil
 		},
+		AllowNonDirectory:   true,
 		FollowSymbolicLinks: false,
 		Unsorted:            true,
 	})
