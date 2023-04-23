@@ -16,7 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/gofrs/uuid"
-	soap "github.com/jbrekelmans/winrm/soap"
+	soap "github.com/jbrekelmans/go-winrm/soap"
 	zenwinrm "github.com/masterzen/winrm"
 	zensoap "github.com/masterzen/winrm/soap"
 	log "github.com/sirupsen/logrus"
