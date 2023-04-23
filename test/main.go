@@ -72,7 +72,7 @@ func main() {
 			}
 			log.WithFields(log.Fields{
 				log.ErrorKey: err1.Error(),
-			}).Fatalf("error while creating remote shell", err1)
+			}).Fatalf("error while creating remote shell")
 		}
 	}
 	defer func() {
