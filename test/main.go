@@ -9,7 +9,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/jbrekelmans/winrm"
+	"github.com/jbrekelmans/go-winrm"
 	log "github.com/sirupsen/logrus"
 )
 
