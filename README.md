@@ -1,3 +1,5 @@
+[![Go Reference](https://pkg.go.dev/badge/github.com/jbrekelmans/go-winrm.svg)](https://pkg.go.dev/github.com/jbrekelmans/go-winrm)
+
 # Introduction
 This package enables clients written in Go to quickly upload files to a Windows server, based on the Windows Remote Management (WinRM) protocol.
 
